@@ -3,11 +3,13 @@ from __future__ import annotations
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.model_utils import normalize_model_list
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
-    app_name: str = Field(default='codex-gateway-python', alias='APP_NAME')
+    app_name: str = Field(default='Looper-AI-Gateway', alias='APP_NAME')
     host: str = Field(default='0.0.0.0', alias='HOST')
     port: int = Field(default=8080, alias='PORT')
     admin_token: str = Field(default='change_me_admin_token', alias='ADMIN_TOKEN')
@@ -20,7 +22,7 @@ class Settings(BaseSettings):
     upstream_transport: str = Field(default='sse', alias='UPSTREAM_TRANSPORT')
     upstream_openai_beta: str = Field(default='responses=experimental', alias='UPSTREAM_OPENAI_BETA')
     default_instructions: str = Field(default='You are a helpful assistant.', alias='DEFAULT_INSTRUCTIONS')
-    default_allowed_models: str = Field(default='gpt-5.4,gpt-5.3,gpt-5.1-codex-mini,gpt-5.3-codex', alias='DEFAULT_ALLOWED_MODELS')
+    default_allowed_models: str = Field(default='gpt-5.5,gpt-5.4,gpt-5.3,gpt-5.1-codex-mini,gpt-5.3-codex', alias='DEFAULT_ALLOWED_MODELS')
 
     oauth_authorize_url: str = Field(default='https://auth.openai.com/oauth/authorize', alias='OAUTH_AUTHORIZE_URL')
     oauth_token_url: str = Field(default='https://auth.openai.com/oauth/token', alias='OAUTH_TOKEN_URL')
@@ -44,7 +46,7 @@ class Settings(BaseSettings):
     def allowed_models(self) -> list[str]:
         if not self.default_allowed_models.strip():
             return []
-        return [x.strip() for x in self.default_allowed_models.split(',') if x.strip()]
+        return normalize_model_list(self.default_allowed_models.split(','))
 
 
 settings = Settings()

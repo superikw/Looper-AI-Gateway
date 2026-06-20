@@ -1,4 +1,4 @@
-# Codex Gateway Python
+# Looper-AI-Gateway
 
 一个给 ChatGPT / Codex 登录态做二次分发的 Python Gateway。
 
@@ -59,7 +59,7 @@
 ## 3. 项目结构
 
 ```text
-codex-gateway-python/
+Looper-AI-Gateway/
 ├── app/
 ├── .env.example
 ├── .env.docker.example
@@ -83,7 +83,7 @@ UPSTREAM_BASE_URL=https://chatgpt.com/backend-api
 UPSTREAM_AUTH_MODE=oauth_manual
 UPSTREAM_OPENAI_BETA=responses=experimental
 DEFAULT_INSTRUCTIONS=You are a helpful assistant.
-DEFAULT_ALLOWED_MODELS=gpt-5.4,gpt-5.3,gpt-5.1-codex-mini,gpt-5.3-codex
+DEFAULT_ALLOWED_MODELS=gpt-5.5,gpt-5.4,gpt-5.3,gpt-5.1-codex-mini,gpt-5.3-codex
 
 OAUTH_AUTHORIZE_URL=https://auth.openai.com/oauth/authorize
 OAUTH_TOKEN_URL=https://auth.openai.com/oauth/token
@@ -114,7 +114,7 @@ python manage.py generate-admin-token
 ### Docker Compose
 
 ```bash
-cd /home/ubuntu/codex-gateway-python
+cd /home/ubuntu/Looper-AI-Gateway
 cp .env.docker.example .env
 # 按需修改 .env
 
@@ -124,7 +124,7 @@ docker compose up -d --build
 ### 查看状态
 
 ```bash
-docker compose exec codex-gateway python manage.py doctor
+docker compose exec looper-ai-gateway python manage.py doctor
 ```
 
 你应该能看到：
@@ -139,7 +139,7 @@ docker compose exec codex-gateway python manage.py doctor
 ### 第一步：发起登录
 
 ```bash
-docker compose exec codex-gateway python manage.py auth-start
+docker compose exec looper-ai-gateway python manage.py auth-start
 ```
 
 会返回：
@@ -163,7 +163,7 @@ http://localhost:1455/auth/callback?code=...&state=...
 ### 第四步：完成登录
 
 ```bash
-docker compose exec codex-gateway python manage.py auth-complete \
+docker compose exec looper-ai-gateway python manage.py auth-complete \
   --session-id 1 \
   --callback-url "http://localhost:1455/auth/callback?code=...&state=..."
 ```
@@ -171,7 +171,7 @@ docker compose exec codex-gateway python manage.py auth-complete \
 ### 第五步：检查登录状态
 
 ```bash
-docker compose exec codex-gateway python manage.py auth-status
+docker compose exec looper-ai-gateway python manage.py auth-status
 ```
 
 如果成功，会看到当前 `credential` 和 `account_id`。
@@ -183,19 +183,19 @@ docker compose exec codex-gateway python manage.py auth-status
 ### 创建用户
 
 ```bash
-docker compose exec codex-gateway python manage.py create-user alice --note "team-a"
+docker compose exec looper-ai-gateway python manage.py create-user alice --note "team-a"
 ```
 
 ### 查看用户
 
 ```bash
-docker compose exec codex-gateway python manage.py list-users
+docker compose exec looper-ai-gateway python manage.py list-users
 ```
 
 ### 创建 API Key
 
 ```bash
-docker compose exec codex-gateway python manage.py create-key --user-id 1 --name alice-dev
+docker compose exec looper-ai-gateway python manage.py create-key --user-id 1 --name alice-dev
 ```
 
 输出里的 `api_key` 明文只会显示一次，记得自己保存。
@@ -203,7 +203,7 @@ docker compose exec codex-gateway python manage.py create-key --user-id 1 --name
 ### 查看 API Key
 
 ```bash
-docker compose exec codex-gateway python manage.py list-keys
+docker compose exec looper-ai-gateway python manage.py list-keys
 ```
 
 ---
@@ -216,7 +216,7 @@ docker compose exec codex-gateway python manage.py list-keys
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Authorization: Bearer 你的gtw_key' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 ### 说明
@@ -237,6 +237,7 @@ You are a helpful assistant.
 
 优先试这些：
 
+- `gpt-5.5`
 - `gpt-5.4`
 - `gpt-5.3`
 - `gpt-5.1-codex-mini`
@@ -257,15 +258,15 @@ You are a helpful assistant.
 最常用的是这些：
 
 ```bash
-docker compose exec codex-gateway python manage.py doctor
-docker compose exec codex-gateway python manage.py auth-start
-docker compose exec codex-gateway python manage.py auth-complete --session-id 1 --callback-url "..."
-docker compose exec codex-gateway python manage.py auth-status
-docker compose exec codex-gateway python manage.py create-user alice --note "team-a"
-docker compose exec codex-gateway python manage.py list-users
-docker compose exec codex-gateway python manage.py create-key --user-id 1 --name alice-dev
-docker compose exec codex-gateway python manage.py list-keys
-docker compose exec codex-gateway python manage.py usage
+docker compose exec looper-ai-gateway python manage.py doctor
+docker compose exec looper-ai-gateway python manage.py auth-start
+docker compose exec looper-ai-gateway python manage.py auth-complete --session-id 1 --callback-url "..."
+docker compose exec looper-ai-gateway python manage.py auth-status
+docker compose exec looper-ai-gateway python manage.py create-user alice --note "team-a"
+docker compose exec looper-ai-gateway python manage.py list-users
+docker compose exec looper-ai-gateway python manage.py create-key --user-id 1 --name alice-dev
+docker compose exec looper-ai-gateway python manage.py list-keys
+docker compose exec looper-ai-gateway python manage.py usage
 ```
 
 ---
@@ -273,7 +274,7 @@ docker compose exec codex-gateway python manage.py usage
 ## 10. 查看用量统计
 
 ```bash
-docker compose exec codex-gateway python manage.py usage
+docker compose exec looper-ai-gateway python manage.py usage
 ```
 
 可以看到每个 key 的：
@@ -288,7 +289,7 @@ docker compose exec codex-gateway python manage.py usage
 ## 11. 看日志
 
 ```bash
-docker compose logs --tail=200 codex-gateway
+docker compose logs --tail=200 looper-ai-gateway
 ```
 
 当前日志里会包含：
@@ -324,7 +325,7 @@ DEFAULT_ALLOWED_MODELS=...
 先看：
 
 ```bash
-docker compose logs --tail=200 codex-gateway
+docker compose logs --tail=200 looper-ai-gateway
 ```
 
 里的 `upstream_response`。

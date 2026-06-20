@@ -264,7 +264,7 @@ async def cmd_usage(_: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Local admin CLI for codex-gateway-python')
+    parser = argparse.ArgumentParser(description='Local admin CLI for Looper-AI-Gateway')
     sub = parser.add_subparsers(dest='command', required=True)
 
     sub.add_parser('doctor', help='Show current config and DB state').set_defaults(func=cmd_doctor)
