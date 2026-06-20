@@ -1,0 +1,25 @@
+services:
+  codex-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: codex-gateway-python
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "34567:8080"
+    volumes:
+      - ./data:/app/data
+      # Optional: only needed if you still want to support codex_auth_file mode
+      # Replace /ABSOLUTE/PATH/TO/.codex with a real absolute path on host
+      # - /ABSOLUTE/PATH/TO/.codex:/root/.codex
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Example admin commands:
+    # docker compose exec codex-gateway python manage.py doctor
+    # docker compose exec codex-gateway python manage.py auth-start
