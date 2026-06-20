@@ -1,9 +1,9 @@
 services:
-  codex-gateway:
+  looper-ai-gateway:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: codex-gateway-python
+    container_name: looper-ai-gateway
     restart: unless-stopped
     env_file:
       - .env
@@ -21,5 +21,5 @@ services:
       retries: 3
       start_period: 10s
     # Example admin commands:
-    # docker compose exec codex-gateway python manage.py doctor
-    # docker compose exec codex-gateway python manage.py auth-start
+    # docker compose exec looper-ai-gateway python manage.py doctor
+    # docker compose exec looper-ai-gateway python manage.py auth-start

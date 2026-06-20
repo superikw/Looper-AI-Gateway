@@ -266,8 +266,9 @@ async def admin_oauth_account(db: AsyncSession = Depends(get_db)):
 
 async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSession) -> JSONResponse:
     payload = await parse_request_json(request)
-    model = payload.get('model')
-    validate_model(model)
+    model = validate_model(payload.get('model'))
+    if model:
+        payload['model'] = model
     status_code, data, req_id = await forward_to_upstream(path, payload, db)
     await record_usage(db, api_key, path, model, status_code, data, req_id)
     return JSONResponse(status_code=status_code, content=data)
