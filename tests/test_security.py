@@ -14,12 +14,13 @@ from app.oauth_manual import get_active_upstream_credential
 from app.utils import utcnow
 
 
-async def test_default_admin_token_is_rejected(client, monkeypatch):
-    monkeypatch.setattr(settings, "admin_token", "change_me_admin_token")
+@pytest.mark.parametrize("token", ["", " " * 32, "short-token", "x" * 31])
+async def test_unconfigured_or_short_admin_token_is_rejected(
+    client, monkeypatch, token
+):
+    monkeypatch.setattr(settings, "admin_token", token)
     assert (
-        await client.get(
-            "/admin/users", headers={"Authorization": "Bearer change_me_admin_token"}
-        )
+        await client.get("/admin/users", headers={"Authorization": f"Bearer {token}"})
     ).status_code == 503
     with pytest.raises(ValueError, match="ADMIN_TOKEN"):
         settings.validate_runtime()

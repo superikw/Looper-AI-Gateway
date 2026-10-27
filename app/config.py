@@ -100,10 +100,7 @@ class Settings(BaseSettings):
 
     @property
     def admin_token_is_secure(self) -> bool:
-        return (
-            len(self.admin_token.strip()) >= 32
-            and self.admin_token != "change_me_admin_token"
-        )
+        return len(self.admin_token.strip()) >= 32
 
     @property
     def allowed_models(self) -> list[str]:

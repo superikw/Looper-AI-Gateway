@@ -48,7 +48,7 @@ docker compose exec looper-ai-gateway python manage.py doctor
 curl http://127.0.0.1:34567/healthz
 ```
 
-管理员口令必须是至少 32 个字符的随机值。空值、过短口令和旧版默认口令会使服务拒绝启动；本地 CLI 生成口令不受此限制。
+管理员口令必须自行配置为至少 32 个字符的随机值。未配置或长度不足时，服务会拒绝启动；本地 CLI 生成口令不受此限制。
 
 默认映射为 `127.0.0.1:34567:8080`：宿主机访问 **34567**，容器内服务监听 **8080**。如需其他机器直接访问，按部署需要修改绑定地址；也可以在宿主机配置反向代理。
 
@@ -76,7 +76,7 @@ python -m app.main
 
 | 配置 | 作用 |
 | --- | --- |
-| `ADMIN_TOKEN` | 管理员口令，无可用默认值 |
+| `ADMIN_TOKEN` | 必须手动配置的管理员随机口令，至少 32 个字符 |
 | `DATABASE_URL` | 默认 `sqlite+aiosqlite:///./data/gateway.db` |
 | `CREDENTIAL_KEY_FILE` | 默认 `./data/credential.key`，首次使用自动生成，文件权限为 0600 |
 | `CREDENTIAL_ENCRYPTION_KEY` | 可选 Fernet 密钥；设置后优先于密钥文件，升级时必须保持一致 |
