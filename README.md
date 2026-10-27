@@ -54,6 +54,8 @@ curl http://127.0.0.1:34567/healthz
 
 Compose 健康检查使用 `/healthz`，因此首次登录之前容器也可以正常启动。`/readyz` 在未登录或凭证不可用时返回 503；返回 200 也不代表已验证模型推理或上游剩余额度。
 
+`env_token` 模式也需要 token 中的 ChatGPT account ID，因为转发必须使用该值设置 `chatgpt-account-id` 请求头。仅配置一个无法提取 account ID 的 token 不满足就绪条件；`/readyz` 不会为此发起上游推理请求。
+
 ## 本地运行
 
 需要 Python 3.12 或更新版本。进程间锁使用 POSIX 文件锁，支持 Linux/macOS；Windows 请使用 Docker。

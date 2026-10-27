@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from typing import Any
 
@@ -25,8 +24,7 @@ from app.protocol import (
     response_failed,
     validate_upstream_data,
 )
-
-JWT_CLAIM_PATH = "https://api.openai.com/auth"
+from app.token_utils import extract_account_id_from_token
 
 
 def log_debug(event: str, **kwargs: Any) -> None:
@@ -70,32 +68,6 @@ async def resolve_upstream_credential(
 async def resolve_upstream_bearer_token(db: AsyncSession | None = None) -> str:
     token, _ = await resolve_upstream_credential(db)
     return token
-
-
-def _decode_jwt_payload(access_token: str) -> dict[str, Any] | None:
-    try:
-        parts = access_token.split(".")
-        if len(parts) != 3:
-            return None
-        payload = parts[1]
-        padding = "=" * (-len(payload) % 4)
-        decoded = base64.urlsafe_b64decode(payload + padding).decode("utf-8")
-        obj = json.loads(decoded)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
-def extract_account_id_from_token(access_token: str) -> str | None:
-    payload = _decode_jwt_payload(access_token)
-    if not payload:
-        return None
-    auth_claim = payload.get(JWT_CLAIM_PATH)
-    if isinstance(auth_claim, dict):
-        account_id = auth_claim.get("chatgpt_account_id")
-        if isinstance(account_id, str) and account_id:
-            return account_id
-    return None
 
 
 def network_error(exc: httpx.RequestError) -> HTTPException:

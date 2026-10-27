@@ -31,7 +31,6 @@ from app.oauth_schemas import OAuthCompleteRequest
 from app.proxy_schemas import validate_proxy_payload
 from app.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyOut, UserCreate, UserOut
 from app.services import (
-    extract_account_id_from_token,
     forward_to_upstream,
     parse_request_json,
     record_usage,
@@ -40,6 +39,7 @@ from app.services import (
     validate_model,
 )
 from app.streaming import stream_to_upstream
+from app.token_utils import extract_account_id_from_token
 from app.utils import make_api_key, mask_key, sha256_text, utcnow
 
 

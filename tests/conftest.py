@@ -1,8 +1,11 @@
+import base64
+import json
 import os
 import tempfile
 from pathlib import Path
 
 import httpx
+import pytest
 import pytest_asyncio
 
 _temp = tempfile.TemporaryDirectory(prefix="looper-tests-")
@@ -14,6 +17,17 @@ from app.db import AsyncSessionLocal, Base, engine
 from app.main import app
 from app.models import ApiKey, User
 from app.utils import sha256_text
+
+
+@pytest.fixture
+def make_jwt():
+    def encode(payload):
+        encoded = (
+            base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        )
+        return f"header.{encoded}.signature"
+
+    return encode
 
 
 @pytest_asyncio.fixture(autouse=True)

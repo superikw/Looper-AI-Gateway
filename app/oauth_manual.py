@@ -17,9 +17,8 @@ from app.config import settings
 from app.http_client import post_oauth
 from app.locks import database_lock
 from app.models import OAuthSession, UpstreamCredential
+from app.token_utils import extract_account_id_from_token
 from app.utils import utcnow
-
-JWT_CLAIM_PATH = "https://api.openai.com/auth"
 
 
 def active_upstream_credential_query():
@@ -155,33 +154,11 @@ def parse_callback_url(callback_url: str) -> dict[str, str]:
     return flat
 
 
-def _decode_jwt_payload(access_token: str) -> dict[str, Any] | None:
-    try:
-        parts = access_token.split(".")
-        if len(parts) != 3:
-            return None
-        payload = parts[1]
-        padding = "=" * (-len(payload) % 4)
-        decoded = base64.urlsafe_b64decode(payload + padding).decode("utf-8")
-        obj = json.loads(decoded)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
 def extract_account_id(access_token: str, token_data: dict[str, Any]) -> str | None:
     direct = token_data.get("account_id")
     if isinstance(direct, str) and direct:
         return direct
-    payload = _decode_jwt_payload(access_token)
-    if not payload:
-        return None
-    auth_claim = payload.get(JWT_CLAIM_PATH)
-    if isinstance(auth_claim, dict):
-        account_id = auth_claim.get("chatgpt_account_id")
-        if isinstance(account_id, str) and account_id:
-            return account_id
-    return None
+    return extract_account_id_from_token(access_token)
 
 
 async def complete_oauth_session(
