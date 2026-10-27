@@ -1,4 +1,28 @@
 services:
+  warp:
+    image: ${WARP_IMAGE:-caomingjun/warp:latest}
+    restart: unless-stopped
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    environment:
+      WARP_SLEEP: ${WARP_SLEEP:-5}
+    expose:
+      - "1080"
+    volumes:
+      - ./warp-data:/var/lib/cloudflare-warp
+      - ./scripts/warp-healthcheck.sh:/usr/local/bin/warp-healthcheck.sh:ro
+    healthcheck:
+      test: ["CMD", "sh", "/usr/local/bin/warp-healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   looper-ai-gateway:
     build:
       context: .
@@ -7,6 +31,14 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      UPSTREAM_PROXY_URL: http://warp:1080
+      HTTP_PROXY: http://warp:1080
+      HTTPS_PROXY: http://warp:1080
+      NO_PROXY: localhost,127.0.0.1,::1
+    depends_on:
+      warp:
+        condition: service_healthy
     ports:
       - "127.0.0.1:34567:8080"
     volumes:

@@ -26,79 +26,74 @@ Chat Completions 支持 `tools` / `tool_choice`、`parallel_tool_calls`、`tempe
 
 协议转换参考：[OpenAI Responses 迁移说明](https://developers.openai.com/api/docs/guides/migrate-to-responses)、[Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)。这些文档描述公开 API 格式，不保证 ChatGPT backend 的全部行为。
 
-## Docker Compose 启动
+## Linux 部署：WARP + Gateway
+
+使用一个 `docker-compose.yml` 启动 WARP 和 Gateway。服务器需要安装 Docker Engine 和 Compose 插件，提供 `/dev/net/tun`，并允许容器使用 `NET_ADMIN`。
 
 ```bash
 git clone https://github.com/superikw/Looper-AI-Gateway.git
 cd Looper-AI-Gateway
+test -c /dev/net/tun
 cp .env.docker.example .env
 ```
 
-先生成管理员口令：
+生成管理员口令，将输出写入 `.env` 的 `ADMIN_TOKEN`：
 
 ```bash
-docker compose run --rm --build looper-ai-gateway python manage.py generate-admin-token
+docker compose run --rm --no-deps --build looper-ai-gateway python manage.py generate-admin-token
 ```
 
-把输出写入 `.env` 的 `ADMIN_TOKEN`，然后启动：
+`--no-deps` 让生成口令时无需启动 WARP。管理员口令必须是至少 32 个字符的随机值，未配置或长度不足时服务会拒绝启动。其余配置可保持默认，使用 `oauth_manual` 登录上游。
+
+启动并检查：
 
 ```bash
 docker compose up -d --build
-docker compose exec looper-ai-gateway python manage.py doctor
+docker compose ps
 curl http://127.0.0.1:34567/healthz
 ```
 
-管理员口令必须自行配置为至少 32 个字符的随机值。未配置或长度不足时，服务会拒绝启动；本地 CLI 生成口令不受此限制。
+Gateway 会等待 WARP 健康检查通过后启动。模型请求、OAuth 换取 token 和刷新 token 都经过 `Gateway → warp:1080 → 上游`。1080 仅供容器内部使用；所有上游账号共享 WARP 出口。浏览器授权登录仍使用浏览器自己的网络。
 
-默认映射为 `127.0.0.1:34567:8080`：宿主机访问 **34567**，容器内服务监听 **8080**。如需其他机器直接访问，按部署需要修改绑定地址；也可以在宿主机配置反向代理。
-
-Compose 健康检查使用 `/healthz`，因此首次登录之前容器也可以正常启动。`/readyz` 在未登录或凭证不可用时返回 503；返回 200 也不代表已验证模型推理或上游剩余额度。
-
-`env_token` 模式也需要 token 中的 ChatGPT account ID，因为转发必须使用该值设置 `chatgpt-account-id` 请求头。仅配置一个无法提取 account ID 的 token 不满足就绪条件；`/readyz` 不会为此发起上游推理请求。
-
-## 可选：通过 WARP 访问上游
-
-默认 Compose 使用直连。需要 WARP 时，先完成上面的 `.env` 和管理员口令配置，然后在 Linux 上启用覆盖文件。宿主机需提供 `/dev/net/tun`，Docker 需允许容器使用 `NET_ADMIN`。
+默认映射为 `127.0.0.1:34567:8080`：宿主机访问 **34567**，容器内服务监听 **8080**。在自己电脑上建立 SSH 隧道即可访问：
 
 ```bash
-test -c /dev/net/tun
-docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d --build
-docker compose -f docker-compose.yml -f docker-compose.warp.yml ps
+ssh -N -L 34567:127.0.0.1:34567 用户名@服务器IP
 ```
 
-覆盖文件新增 `caomingjun/warp` 服务，并让 Gateway 等待它通过健康检查后启动。健康检查通过容器内的 HTTP 代理请求 Cloudflare trace，只有请求成功且包含独立一行 `warp=on` 或 `warp=plus` 才通过。运行配置参考 [warp-docker 项目](https://github.com/cmj2002/warp-docker)，可用 `WARP_IMAGE` 指定已发布的标签或完整镜像 digest，`WARP_SLEEP` 默认 5 秒。
+保持 SSH 连接，客户端 Base URL 使用 `http://127.0.0.1:34567/v1`，API Key 使用后续创建的 `gtw_...`。也可在服务器配置 HTTPS 反向代理。
 
-流量经过 `Gateway → warp:1080 → 上游`。1080 仅供同一 Compose 网络使用，不映射到宿主机。Gateway 端口仍为 `127.0.0.1:34567`；此配置代理上游出站请求，不改变客户端访问入口，也不提供每账号独立出口。
-
-模型请求、OAuth 换取 token 和刷新 token 都使用 `UPSTREAM_PROXY_URL=http://warp:1080`。这是明确指定的代理，优先于 HTTPX 的环境代理规则，也不会被 `NO_PROXY=*` 绕过。覆盖文件同时为其他支持环境代理的工具设置 `HTTP_PROXY`、`HTTPS_PROXY` 和本地地址的 `NO_PROXY`。浏览器中的授权登录仍使用浏览器自己的网络。
-
-WARP 数据保存在 `./warp-data`，与 Gateway 的数据库和密钥目录 `./data` 分开。两个目录都在 Git 和 Docker 构建上下文中排除。不要把 Gateway 的数据库目录挂载到 WARP 容器。
-
-启用后，管理命令也使用相同的两个 Compose 文件：
+登录上游和创建下游 Key 的步骤见后文，管理命令统一使用 `docker compose exec`：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.warp.yml exec looper-ai-gateway python manage.py auth-start
-docker compose -f docker-compose.yml -f docker-compose.warp.yml exec looper-ai-gateway python manage.py list-upstreams
+docker compose exec looper-ai-gateway python manage.py auth-start
+docker compose exec looper-ai-gateway python manage.py list-upstreams
 ```
 
-检查代理和日志：
+首次登录前，`/readyz` 返回 503 属于正常情况；该接口只检查数据库与上游凭证，返回 200 不代表已验证代理或模型推理。
+
+检查 WARP 和日志：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.warp.yml exec warp sh /usr/local/bin/warp-healthcheck.sh
-docker compose -f docker-compose.yml -f docker-compose.warp.yml logs --tail=100 warp looper-ai-gateway
+docker compose exec warp sh /usr/local/bin/warp-healthcheck.sh
+docker compose logs --tail=100 warp looper-ai-gateway
 ```
+
+健康检查通过代理请求 Cloudflare trace，仅在包含独立一行 `warp=on` 或 `warp=plus` 时通过；手动执行成功时无输出，退出码为 0。运行配置参考 [warp-docker 项目](https://github.com/cmj2002/warp-docker)，可在 `.env` 中通过 `WARP_IMAGE` 固定镜像标签或 digest，`WARP_SLEEP` 默认 5 秒。
 
 代理不可用时不会自动回退直连。代理连接失败返回 503，代理路径超时返回 504，流式输出开始后的网络故障通过 SSE 报错并记录失败状态。明确的代理错误，以及配置了 `UPSTREAM_PROXY_URL` 后无法归属账号的网络错误，不会冷却账号或轮换账号重试；并发名额仍会释放，尝试次数和已知用量仍记录。上游明确返回的 401、403、429、5xx 和模型失败事件继续按账号故障规则处理。
 
-健康状态用于启动依赖和监控；WARP 运行中变为 unhealthy 不会自动停止或重启 Gateway。`/readyz` 仍只检查数据库与账号凭证，不代表代理或模型推理端到端可用。
+WARP 运行中变为 unhealthy 不会自动停止或重启 Gateway。账号的 RPM、并发和最小间隔配置仍支持动态更新。
 
-切回直连时，先确认 `.env` 中 `UPSTREAM_PROXY_URL` 留空，并移除自行添加的环境代理配置，然后执行：
+Gateway 数据持久化到 `./data`，WARP 注册数据持久化到 `./warp-data`。升级前备份这两个目录，特别要一起保留 `data/gateway.db` 和 `data/credential.key`，然后更新：
 
 ```bash
-docker compose -f docker-compose.yml up -d --build --remove-orphans
+git pull --ff-only
+docker compose pull warp
+docker compose up -d --build
 ```
 
-这会重建 Gateway 并移除可选的 WARP 容器，保留两个数据目录。代理地址属于进程配置，修改后需重建容器；账号的 RPM、并发和最小间隔配置仍支持动态更新。
+已有部署保留原来的 `.env` 和数据目录。之前使用双 Compose 文件的部署，更新后也直接使用上述命令。
 
 ## 本地运行
 
@@ -127,7 +122,7 @@ python -m app.main
 | `UPSTREAM_BASE_URL` | 默认 `https://chatgpt.com/backend-api` |
 | `UPSTREAM_AUTH_MODE` | `oauth_manual`、`codex_auth_file` 或 `env_token` |
 | `UPSTREAM_TIMEOUT_SECONDS` | 上游 HTTP 超时，默认 120 秒 |
-| `UPSTREAM_PROXY_URL` | 可选 HTTP(S) 代理，作用于模型请求和 OAuth 换取/刷新；WARP 覆盖文件设置为 `http://warp:1080` |
+| `UPSTREAM_PROXY_URL` | 可选 HTTP(S) 代理，作用于模型请求和 OAuth 换取/刷新；Docker Compose 固定设置为 `http://warp:1080` |
 | `UPSTREAM_MAX_ATTEMPTS` | 账号池每个请求最多尝试的不同账号数，默认 3，范围 1–10；固定绑定只尝试一个 |
 | `UPSTREAM_FAILURE_COOLDOWN_SECONDS` | 连接或服务端错误后的冷却秒数，默认 10 |
 | `UPSTREAM_RATE_LIMIT_COOLDOWN_SECONDS` | 429 缺少有效 Retry-After 时的冷却秒数，默认 60 |
@@ -315,4 +310,4 @@ ruff check app manage.py tests
 ruff format --check app manage.py tests
 ```
 
-测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新与账号轮换、滚动 RPM、并发上限、动态限额、崩溃回收、故障冷却、Key 绑定、账号用量归属、工具与图片转换、SSE 拆包、流式取消、共享代理故障和就绪检查。代理测试包含本地 HTTP 代理服务器与 CONNECT 拒绝场景，不依赖真实 WARP。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查，并校验直连和 WARP 两种 Compose 配置。
+测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新与账号轮换、滚动 RPM、并发上限、动态限额、崩溃回收、故障冷却、Key 绑定、账号用量归属、工具与图片转换、SSE 拆包、流式取消、共享代理故障和就绪检查。代理测试包含本地 HTTP 代理服务器与 CONNECT 拒绝场景，不依赖真实 WARP。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查，并校验 WARP + Gateway 的 Compose 配置。
