@@ -56,6 +56,50 @@ Compose 健康检查使用 `/healthz`，因此首次登录之前容器也可以�
 
 `env_token` 模式也需要 token 中的 ChatGPT account ID，因为转发必须使用该值设置 `chatgpt-account-id` 请求头。仅配置一个无法提取 account ID 的 token 不满足就绪条件；`/readyz` 不会为此发起上游推理请求。
 
+## 可选：通过 WARP 访问上游
+
+默认 Compose 使用直连。需要 WARP 时，先完成上面的 `.env` 和管理员口令配置，然后在 Linux 上启用覆盖文件。宿主机需提供 `/dev/net/tun`，Docker 需允许容器使用 `NET_ADMIN`。
+
+```bash
+test -c /dev/net/tun
+docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.warp.yml ps
+```
+
+覆盖文件新增 `caomingjun/warp` 服务，并让 Gateway 等待它通过健康检查后启动。健康检查通过容器内的 HTTP 代理请求 Cloudflare trace，只有请求成功且包含独立一行 `warp=on` 或 `warp=plus` 才通过。运行配置参考 [warp-docker 项目](https://github.com/cmj2002/warp-docker)，可用 `WARP_IMAGE` 指定已发布的标签或完整镜像 digest，`WARP_SLEEP` 默认 5 秒。
+
+流量经过 `Gateway → warp:1080 → 上游`。1080 仅供同一 Compose 网络使用，不映射到宿主机。Gateway 端口仍为 `127.0.0.1:34567`；此配置代理上游出站请求，不改变客户端访问入口，也不提供每账号独立出口。
+
+模型请求、OAuth 换取 token 和刷新 token 都使用 `UPSTREAM_PROXY_URL=http://warp:1080`。这是明确指定的代理，优先于 HTTPX 的环境代理规则，也不会被 `NO_PROXY=*` 绕过。覆盖文件同时为其他支持环境代理的工具设置 `HTTP_PROXY`、`HTTPS_PROXY` 和本地地址的 `NO_PROXY`。浏览器中的授权登录仍使用浏览器自己的网络。
+
+WARP 数据保存在 `./warp-data`，与 Gateway 的数据库和密钥目录 `./data` 分开。两个目录都在 Git 和 Docker 构建上下文中排除。不要把 Gateway 的数据库目录挂载到 WARP 容器。
+
+启用后，管理命令也使用相同的两个 Compose 文件：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.warp.yml exec looper-ai-gateway python manage.py auth-start
+docker compose -f docker-compose.yml -f docker-compose.warp.yml exec looper-ai-gateway python manage.py list-upstreams
+```
+
+检查代理和日志：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.warp.yml exec warp sh /usr/local/bin/warp-healthcheck.sh
+docker compose -f docker-compose.yml -f docker-compose.warp.yml logs --tail=100 warp looper-ai-gateway
+```
+
+代理不可用时不会自动回退直连。代理连接失败返回 503，代理路径超时返回 504，流式输出开始后的网络故障通过 SSE 报错并记录失败状态。明确的代理错误，以及配置了 `UPSTREAM_PROXY_URL` 后无法归属账号的网络错误，不会冷却账号或轮换账号重试；并发名额仍会释放，尝试次数和已知用量仍记录。上游明确返回的 401、403、429、5xx 和模型失败事件继续按账号故障规则处理。
+
+健康状态用于启动依赖和监控；WARP 运行中变为 unhealthy 不会自动停止或重启 Gateway。`/readyz` 仍只检查数据库与账号凭证，不代表代理或模型推理端到端可用。
+
+切回直连时，先确认 `.env` 中 `UPSTREAM_PROXY_URL` 留空，并移除自行添加的环境代理配置，然后执行：
+
+```bash
+docker compose -f docker-compose.yml up -d --build --remove-orphans
+```
+
+这会重建 Gateway 并移除可选的 WARP 容器，保留两个数据目录。代理地址属于进程配置，修改后需重建容器；账号的 RPM、并发和最小间隔配置仍支持动态更新。
+
 ## 本地运行
 
 需要 Python 3.12 或更新版本。进程间锁使用 POSIX 文件锁，支持 Linux/macOS；Windows 请使用 Docker。
@@ -83,6 +127,7 @@ python -m app.main
 | `UPSTREAM_BASE_URL` | 默认 `https://chatgpt.com/backend-api` |
 | `UPSTREAM_AUTH_MODE` | `oauth_manual`、`codex_auth_file` 或 `env_token` |
 | `UPSTREAM_TIMEOUT_SECONDS` | 上游 HTTP 超时，默认 120 秒 |
+| `UPSTREAM_PROXY_URL` | 可选 HTTP(S) 代理，作用于模型请求和 OAuth 换取/刷新；WARP 覆盖文件设置为 `http://warp:1080` |
 | `UPSTREAM_MAX_ATTEMPTS` | 账号池每个请求最多尝试的不同账号数，默认 3，范围 1–10；固定绑定只尝试一个 |
 | `UPSTREAM_FAILURE_COOLDOWN_SECONDS` | 连接或服务端错误后的冷却秒数，默认 10 |
 | `UPSTREAM_RATE_LIMIT_COOLDOWN_SECONDS` | 429 缺少有效 Retry-After 时的冷却秒数，默认 60 |
@@ -270,4 +315,4 @@ ruff check app manage.py tests
 ruff format --check app manage.py tests
 ```
 
-测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新与账号轮换、滚动 RPM、并发上限、动态限额、崩溃回收、故障冷却、Key 绑定、账号用量归属、工具与图片转换、SSE 拆包、流式取消和就绪检查。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查。
+测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新与账号轮换、滚动 RPM、并发上限、动态限额、崩溃回收、故障冷却、Key 绑定、账号用量归属、工具与图片转换、SSE 拆包、流式取消、共享代理故障和就绪检查。代理测试包含本地 HTTP 代理服务器与 CONNECT 拒绝场景，不依赖真实 WARP。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查，并校验直连和 WARP 两种 Compose 配置。
