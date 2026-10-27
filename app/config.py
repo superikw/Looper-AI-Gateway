@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     upstream_auth_mode: str = Field(default='oauth_manual', alias='UPSTREAM_AUTH_MODE')
     upstream_bearer_token: str = Field(default='', alias='UPSTREAM_BEARER_TOKEN')
     upstream_timeout_seconds: int = Field(default=120, alias='UPSTREAM_TIMEOUT_SECONDS')
+    max_request_bytes: int = Field(default=16 * 1024 * 1024, alias='MAX_REQUEST_BYTES', gt=0)
     upstream_transport: str = Field(default='sse', alias='UPSTREAM_TRANSPORT')
     upstream_openai_beta: str = Field(default='responses=experimental', alias='UPSTREAM_OPENAI_BETA')
     default_instructions: str = Field(default='You are a helpful assistant.', alias='DEFAULT_INSTRUCTIONS')

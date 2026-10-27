@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import time
 from typing import Any
 
 import httpx
@@ -15,6 +14,10 @@ from app.config import settings
 from app.model_utils import canonicalize_model_name
 from app.models import ApiKey, UsageLog
 from app.oauth_manual import get_active_upstream_credential
+from app.http_client import get_http_client
+from app.protocol import (build_codex_request_body, parse_sse_events, extract_sse_json,
+    normalize_codex_response_to_chat, normalize_codex_response_to_responses,
+    decode_sse_data, ResponseAccumulator, response_failed, validate_upstream_data, reject_constant)
 
 JWT_CLAIM_PATH = 'https://api.openai.com/auth'
 
@@ -89,305 +92,102 @@ def extract_account_id_from_token(access_token: str) -> str | None:
     return None
 
 
-def _convert_content_to_parts(content: Any) -> list[dict[str, Any]]:
-    if isinstance(content, str):
-        return [{'type': 'input_text', 'text': content}]
-    parts: list[dict[str, Any]] = []
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get('type')
-            if block_type in ('text', 'input_text', 'output_text'):
-                text = block.get('text') or block.get('content') or ''
-                if text:
-                    parts.append({'type': 'input_text', 'text': text})
-    return parts
+def network_error(exc: httpx.RequestError) -> HTTPException:
+    if isinstance(exc, httpx.TimeoutException):
+        return HTTPException(504, 'upstream request timed out')
+    return HTTPException(502, 'upstream connection failed')
 
 
-def _convert_messages_to_input(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
-    items: list[dict[str, Any]] = []
-    system_prompt: str | None = None
-    for msg in messages:
-        role = msg.get('role')
-        content = msg.get('content')
-        if role in ('system', 'developer'):
-            parts = _convert_content_to_parts(content)
-            text = '\n'.join(p['text'] for p in parts if p.get('text'))
-            if text:
-                system_prompt = f"{system_prompt}\n{text}".strip() if system_prompt else text
-            continue
-
-        if role == 'assistant':
-            assistant_parts = []
-            if isinstance(content, str):
-                assistant_parts = [{'type': 'output_text', 'text': content, 'annotations': []}]
-            elif isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    block_type = block.get('type')
-                    if block_type in ('text', 'output_text', 'input_text'):
-                        text = block.get('text') or block.get('content') or ''
-                        if text:
-                            assistant_parts.append({'type': 'output_text', 'text': text, 'annotations': []})
-            if assistant_parts:
-                items.append({
-                    'type': 'message',
-                    'role': 'assistant',
-                    'status': 'completed',
-                    'content': assistant_parts,
-                })
-            continue
-
-        parts = _convert_content_to_parts(content)
-        if not parts:
-            continue
-        items.append({'role': 'user', 'content': parts})
-    return items, system_prompt
+async def open_upstream(path: str, payload: dict[str, Any], db: AsyncSession | None = None) -> httpx.Response:
+    body = build_codex_request_body(path, payload)
+    bearer, account = await resolve_upstream_credential(db)
+    account = account or extract_account_id_from_token(bearer)
+    if not account:
+        raise HTTPException(502, 'upstream credential does not contain a ChatGPT account ID')
+    url = f"{settings.upstream_base_url.rstrip('/')}/codex/responses"
+    headers = {'Authorization':f'Bearer {bearer}', 'chatgpt-account-id':account,
+               'OpenAI-Beta':settings.upstream_openai_beta, 'originator':settings.oauth_originator,
+               'User-Agent':'pi (linux x86_64)', 'accept':'text/event-stream'}
+    log_debug('upstream_request', path=path, model=body['model'])
+    client = get_http_client()
+    try:
+        response = await client.send(client.build_request('POST', url, headers=headers, json=body), stream=True)
+    except httpx.RequestError as exc:
+        raise network_error(exc) from None
+    log_debug('upstream_response', path=path, status_code=response.status_code, request_id=request_id(response))
+    return response
 
 
-def build_codex_request_body(path: str, payload: dict[str, Any]) -> dict[str, Any]:
-    model = canonicalize_model_name(payload.get('model'))
-    body: dict[str, Any] = {
-        'model': model,
-        'store': False,
-        'stream': True,
-        'text': {'verbosity': 'medium'},
-        'include': ['reasoning.encrypted_content'],
-        'tool_choice': 'auto',
-        'parallel_tool_calls': True,
-    }
+def request_id(response: httpx.Response) -> str | None:
+    return response.headers.get('x-request-id') or response.headers.get('openai-request-id')
 
+
+async def iter_upstream_events(response: httpx.Response):
+    lines = []
+    try:
+        async for line in response.aiter_lines():
+            if not line:
+                event = decode_sse_data(lines)
+                lines = []
+                if event is not None:
+                    yield event
+            elif line.startswith('data:'):
+                lines.append(line[5:].removeprefix(' '))
+        event = decode_sse_data(lines)
+        if event is not None:
+            yield event
+    except httpx.RequestError as exc:
+        raise network_error(exc) from None
+
+
+def format_upstream_result(path: str, payload: dict, status_code: int, data: dict) -> tuple[int, dict]:
+    validate_upstream_data(data)
+    if status_code >= 400 or response_failed(data):
+        error = data.get('error') or {'message':'upstream response failed', 'type':'upstream_error'}
+        if not isinstance(error, dict):
+            error = {'message':str(error), 'type':'upstream_error'}
+        result = {'error':error}
+        if data.get('usage'):
+            result['usage'] = data['usage']
+        return status_code if status_code >= 400 else 502, result
     if path == '/v1/chat/completions':
-        messages = payload.get('messages') or []
-        input_items, system_prompt = _convert_messages_to_input(messages)
-        body['input'] = input_items
-        body['instructions'] = system_prompt or settings.default_instructions
-    elif path == '/v1/responses':
-        input_value = payload.get('input')
-        if isinstance(input_value, str):
-            body['input'] = [{'role': 'user', 'content': [{'type': 'input_text', 'text': input_value}]}]
-        elif isinstance(input_value, list):
-            body['input'] = input_value
-        else:
-            body['input'] = []
-        body['instructions'] = payload.get('instructions') or settings.default_instructions
-    else:
-        raise HTTPException(status_code=400, detail=f'unsupported codex backend path: {path}')
-
-    if payload.get('temperature') is not None:
-        body['temperature'] = payload.get('temperature')
-    if payload.get('max_output_tokens') is not None:
-        body['max_output_tokens'] = payload.get('max_output_tokens')
-    if payload.get('reasoning') is not None:
-        body['reasoning'] = payload.get('reasoning')
-    if payload.get('metadata') is not None:
-        body['metadata'] = payload.get('metadata')
-    return body
+        return status_code, normalize_codex_response_to_chat(data, payload['model'])
+    return status_code, normalize_codex_response_to_responses(data)
 
 
-def parse_sse_events(text: str) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    for chunk in text.split('\n\n'):
-        lines = [line[5:].strip() for line in chunk.splitlines() if line.startswith('data:')]
-        if not lines:
-            continue
-        data = '\n'.join(lines).strip()
-        if not data or data == '[DONE]':
-            continue
-        try:
-            obj = json.loads(data)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            events.append(obj)
-    return events
-
-
-def extract_sse_json(text: str) -> dict[str, Any] | None:
-    candidates = parse_sse_events(text)
-    delta_text_parts: list[str] = []
-    done_text_parts: list[str] = []
-    for obj in candidates:
-        event_type = obj.get('type')
-        if event_type in ('response.output_text.delta', 'response.refusal.delta'):
-            delta = obj.get('delta')
-            if isinstance(delta, str) and delta:
-                delta_text_parts.append(delta)
-        elif event_type == 'response.output_item.done':
-            item = obj.get('item')
-            if isinstance(item, dict) and item.get('type') == 'message':
-                for content in item.get('content', []) or []:
-                    if isinstance(content, dict):
-                        if content.get('type') == 'output_text' and isinstance(content.get('text'), str):
-                            done_text_parts.append(content['text'])
-                        elif content.get('type') == 'refusal' and isinstance(content.get('refusal'), str):
-                            done_text_parts.append(content['refusal'])
-    aggregated_text = ''.join(delta_text_parts) if delta_text_parts else ''.join(done_text_parts)
-    for obj in reversed(candidates):
-        event_type = obj.get('type')
-        if event_type in ('response.completed', 'response.done') and isinstance(obj.get('response'), dict):
-            response = dict(obj['response'])
-            if aggregated_text and not response.get('output_text'):
-                response['output_text'] = aggregated_text
-            return response
-    for obj in reversed(candidates):
-        if isinstance(obj, dict) and ('output' in obj or 'output_text' in obj or 'usage' in obj):
-            response = dict(obj)
-            if aggregated_text and not response.get('output_text'):
-                response['output_text'] = aggregated_text
-            return response
-    if aggregated_text:
-        return {'output_text': aggregated_text}
-    return None
-
-
-def normalize_codex_response_to_chat(data: dict[str, Any], model: str) -> dict[str, Any]:
-    output_text = data.get('output_text')
-    if not output_text:
-        parts: list[str] = []
-        for item in data.get('output', []) or []:
-            if not isinstance(item, dict):
-                continue
-            if item.get('type') == 'message':
-                for content in item.get('content', []) or []:
-                    if isinstance(content, dict):
-                        text = content.get('text') or content.get('output_text')
-                        if text:
-                            parts.append(text)
-            elif item.get('type') in ('output_text', 'text'):
-                text = item.get('text') or item.get('output_text')
-                if text:
-                    parts.append(text)
-        output_text = ''.join(parts)
-    if not output_text and isinstance(data.get('error'), dict):
-        output_text = data['error'].get('message', '')
-
-    usage = data.get('usage') or {}
-    prompt_tokens = int(usage.get('input_tokens') or usage.get('prompt_tokens') or 0)
-    completion_tokens = int(usage.get('output_tokens') or usage.get('completion_tokens') or 0)
-    total_tokens = int(usage.get('total_tokens') or (prompt_tokens + completion_tokens))
-
-    return {
-        'id': data.get('id', 'codex_response'),
-        'object': 'chat.completion',
-        'created': int(time.time()),
-        'model': model,
-        'choices': [{
-            'index': 0,
-            'message': {'role': 'assistant', 'content': output_text or ''},
-            'finish_reason': 'stop',
-        }],
-        'usage': {
-            'prompt_tokens': prompt_tokens,
-            'completion_tokens': completion_tokens,
-            'total_tokens': total_tokens,
-        },
-        '_codex_raw': data,
-    }
-
-
-def normalize_codex_response_to_responses(data: dict[str, Any]) -> dict[str, Any]:
-    usage = data.get('usage') or {}
-    return {
-        'id': data.get('id'),
-        'object': 'response',
-        'model': data.get('model'),
-        'output': data.get('output', []),
-        'output_text': data.get('output_text', ''),
-        'usage': {
-            'input_tokens': int(usage.get('input_tokens') or 0),
-            'output_tokens': int(usage.get('output_tokens') or 0),
-            'total_tokens': int(usage.get('total_tokens') or 0),
-        },
-        '_codex_raw': data,
-    }
+async def read_upstream_data(response: httpx.Response) -> dict:
+    if 'text/event-stream' in response.headers.get('content-type', '') and response.status_code < 400:
+        accumulator = ResponseAccumulator()
+        async for event in iter_upstream_events(response):
+            accumulator.add(event)
+            if accumulator.terminal:
+                break
+        return accumulator.result()
+    try:
+        await response.aread()
+    except httpx.RequestError as exc:
+        raise network_error(exc) from None
+    try:
+        data = response.json(parse_constant=reject_constant)
+    except ValueError:
+        raise HTTPException(502, 'upstream returned a non-JSON response') from None
+    if not isinstance(data, dict):
+        raise HTTPException(502, 'upstream returned a non-object response')
+    if response.status_code < 400 and not any(key in data for key in ('output', 'output_text', 'error')):
+        raise HTTPException(502, 'upstream returned an invalid response')
+    return data
 
 
 async def forward_to_upstream(path: str, payload: dict[str, Any], db: AsyncSession | None = None) -> tuple[int, dict[str, Any], str | None]:
-    bearer_token, account_id = await resolve_upstream_credential(db)
-    account_id = account_id or extract_account_id_from_token(bearer_token)
-    if not account_id:
-        raise HTTPException(status_code=500, detail='failed to extract chatgpt_account_id from token')
-
-    if path == '/v1/embeddings':
-        raise HTTPException(status_code=400, detail='embeddings are not supported in codex backend mode')
-
-    codex_body = build_codex_request_body(path, payload)
-    url = f"{settings.upstream_base_url.rstrip('/')}/codex/responses"
-    headers = {
-        'Authorization': f'Bearer {bearer_token}',
-        'chatgpt-account-id': account_id,
-        'OpenAI-Beta': settings.upstream_openai_beta,
-        'originator': settings.oauth_originator,
-        'User-Agent': 'pi (linux x86_64)',
-        'accept': 'text/event-stream',
-        'content-type': 'application/json',
-    }
-
-    log_debug(
-        'upstream_request',
-        target='codex_backend',
-        path=path,
-        url=url,
-        model=payload.get('model'),
-        headers={
-            'OpenAI-Beta': settings.upstream_openai_beta,
-            'originator': settings.oauth_originator,
-            'accept': headers['accept'],
-            'content-type': headers['content-type'],
-        },
-    )
-
-    async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
-        resp = await client.post(url, headers=headers, json=codex_body)
-
-    req_id = resp.headers.get('x-request-id') or resp.headers.get('openai-request-id')
-    raw_text = resp.text
-    content_type = resp.headers.get('content-type', '')
-
-    data: dict[str, Any]
-    parsed = None
+    response = await open_upstream(path, payload, db)
     try:
-        parsed = resp.json()
-    except Exception:
-        parsed = None
+        data = await read_upstream_data(response)
+        code, result = format_upstream_result(path, payload, response.status_code, data)
+        return code, result, request_id(response)
+    finally:
+        await response.aclose()
 
-    if isinstance(parsed, dict):
-        data = parsed
-    else:
-        sse_obj = extract_sse_json(raw_text)
-        if isinstance(sse_obj, dict):
-            data = sse_obj
-        else:
-            data = {
-                'error': {
-                    'message': raw_text[:2000],
-                    'content_type': content_type,
-                    'status_code': resp.status_code,
-                }
-            }
 
-    log_debug(
-        'upstream_response',
-        target='codex_backend',
-        path=path,
-        url=url,
-        status_code=resp.status_code,
-        request_id=req_id,
-        content_type=content_type,
-        parsed_keys=list(data.keys()) if isinstance(data, dict) else None,
-    )
-
-    if resp.status_code >= 400:
-        return resp.status_code, data, req_id
-
-    if path == '/v1/chat/completions':
-        return resp.status_code, normalize_codex_response_to_chat(data, payload.get('model') or data.get('model') or ''), req_id
-    if path == '/v1/responses':
-        return resp.status_code, normalize_codex_response_to_responses(data), req_id
-    return resp.status_code, data, req_id
 
 
 async def record_usage(
@@ -435,6 +235,8 @@ async def record_usage(
 
 
 def validate_model(model: str | None) -> str | None:
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(400, 'model must be a non-empty string')
     normalized_model = canonicalize_model_name(model)
     allowed = settings.allowed_models
     if allowed and normalized_model and normalized_model not in allowed:
@@ -446,7 +248,15 @@ def validate_model(model: str | None) -> str | None:
 
 
 async def parse_request_json(request: Request) -> dict[str, Any]:
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > settings.max_request_bytes:
+            raise HTTPException(413, 'request body exceeds MAX_REQUEST_BYTES')
     try:
-        return await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail='invalid json body')
+        result = json.loads(body, parse_constant=reject_constant)
+    except (ValueError, UnicodeError):
+        raise HTTPException(400, 'invalid JSON body') from None
+    if not isinstance(result, dict):
+        raise HTTPException(400, 'JSON body must be an object')
+    return result

@@ -4,10 +4,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import asyncio
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +21,8 @@ from app.db import Base, engine, get_db
 from app.models import ApiKey, OAuthSession, UpstreamCredential, User
 from app.migrations import initialize_database
 from app.http_client import close_http_client
+from app.proxy_schemas import validate_proxy_payload
+from app.streaming import stream_to_upstream
 from app.oauth_manual import complete_oauth_session, start_oauth_session
 from app.oauth_schemas import OAuthCompleteRequest
 from app.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyOut, UserCreate, UserOut
@@ -39,6 +43,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request: Request, exc: StarletteHTTPException):
+    if not request.url.path.startswith('/v1/'):
+        return JSONResponse({'detail':exc.detail}, status_code=exc.status_code, headers=exc.headers)
+    message = exc.detail if isinstance(exc.detail, str) else 'invalid request'
+    error = {'message':message, 'type':'invalid_request_error' if exc.status_code < 500 else 'gateway_error'}
+    if not isinstance(exc.detail, str):
+        error['details'] = exc.detail
+    return JSONResponse({'error':error}, status_code=exc.status_code, headers=exc.headers)
 
 
 @app.get('/healthz')
@@ -165,7 +180,7 @@ async def usage_summary(db: AsyncSession = Depends(get_db)):
 
 @app.get('/admin/auth/upstream', dependencies=[Depends(require_admin)])
 async def get_upstream_auth_status(db: AsyncSession = Depends(get_db)):
-    auth_state = codex_auth_manager.login_status()
+    auth_state = await asyncio.to_thread(codex_auth_manager.login_status)
     latest_credential = None
     cred = (await db.execute(select(UpstreamCredential).where(UpstreamCredential.provider == 'codex').order_by(UpstreamCredential.id.desc()))).scalars().first()
     if cred:
@@ -209,13 +224,13 @@ async def get_upstream_auth_status(db: AsyncSession = Depends(get_db)):
 
 @app.post('/admin/auth/codex/login/start', response_model=LoginStartResponse, dependencies=[Depends(require_admin)])
 async def start_codex_login():
-    result = codex_auth_manager.start_login()
+    result = await asyncio.to_thread(codex_auth_manager.start_login)
     return LoginStartResponse(**result)
 
 
 @app.get('/admin/auth/codex/login/status', dependencies=[Depends(require_admin)])
 async def codex_login_status():
-    return codex_auth_manager.login_status()
+    return await asyncio.to_thread(codex_auth_manager.login_status)
 
 
 @app.post('/admin/auth/codex/oauth/start', dependencies=[Depends(require_admin)])
@@ -272,14 +287,21 @@ async def admin_oauth_account(db: AsyncSession = Depends(get_db)):
     }
 
 
-async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSession) -> JSONResponse:
-    payload = await parse_request_json(request)
-    model = validate_model(payload.get('model'))
-    if model:
+async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSession):
+    model = None
+    try:
+        payload = validate_proxy_payload(path, await parse_request_json(request))
+        model = validate_model(payload['model'])
         payload['model'] = model
-    status_code, data, req_id = await forward_to_upstream(path, payload, db)
+        if payload['stream']:
+            return await stream_to_upstream(path, payload, db, api_key)
+        status_code, data, req_id = await forward_to_upstream(path, payload, db)
+    except HTTPException as exc:
+        await record_usage(db, api_key, path, model, exc.status_code, {'error':{'message':str(exc.detail)}}, None)
+        raise
     await record_usage(db, api_key, path, model, status_code, data, req_id)
-    return JSONResponse(status_code=status_code, content=data)
+    headers = {'x-request-id':req_id} if req_id else None
+    return JSONResponse(status_code=status_code, content=data, headers=headers)
 
 
 @app.post('/v1/chat/completions')
