@@ -40,7 +40,7 @@ def log_debug(event: str, **kwargs: Any) -> None:
 async def resolve_upstream_credential(
     db: AsyncSession | None = None,
 ) -> tuple[str, str | None]:
-    mode = settings.upstream_auth_mode.strip().lower() or "oauth_manual"
+    mode = settings.upstream_auth_mode
     if mode == "env_token":
         if not settings.upstream_bearer_token:
             raise HTTPException(
@@ -52,31 +52,19 @@ async def resolve_upstream_credential(
             return codex_auth_manager.load_bearer_token(), None
         except CodexAuthError as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
-    if mode == "oauth_manual":
-        if db is None:
-            raise HTTPException(
-                status_code=500,
-                detail="database session required for oauth_manual mode",
-            )
-        credential = await get_active_upstream_credential(db)
-        if not credential or not credential.access_token:
-            raise HTTPException(
-                status_code=401, detail="no active oauth credential; start login first"
-            )
-        return credential.access_token, credential.account_id
-
-    if settings.upstream_bearer_token:
-        return settings.upstream_bearer_token, None
-    if db is not None:
-        credential = await get_active_upstream_credential(db)
-        if credential and credential.access_token:
-            return credential.access_token, credential.account_id
-    try:
-        return codex_auth_manager.load_bearer_token(), None
-    except CodexAuthError as e:
+    if mode != "oauth_manual":
+        raise HTTPException(500, "unsupported upstream authentication mode")
+    if db is None:
         raise HTTPException(
-            status_code=500, detail=f"no usable upstream auth found: {e}"
-        ) from e
+            status_code=500,
+            detail="database session required for oauth_manual mode",
+        )
+    credential = await get_active_upstream_credential(db)
+    if not credential or not credential.access_token:
+        raise HTTPException(
+            status_code=401, detail="no active oauth credential; start login first"
+        )
+    return credential.access_token, credential.account_id
 
 
 async def resolve_upstream_bearer_token(db: AsyncSession | None = None) -> str:
