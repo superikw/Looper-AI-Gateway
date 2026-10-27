@@ -192,6 +192,30 @@ def build_codex_request_body(path: str, payload: dict[str, Any]) -> dict[str, An
     ):
         if payload.get(name) is not None:
             body[name] = payload[name]
+    # Preserve client-specific request options. The upstream backend is the
+    # authority on whether an option is supported; this relay must not turn
+    # every new client field into a local 400 error or silently drop it.
+    converted = {
+        "model",
+        "messages",
+        "input",
+        "stream",
+        "store",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "text",
+        "include",
+        "truncation",
+        "max_tokens",
+        "max_completion_tokens",
+        "response_format",
+        "reasoning_effort",
+        "stream_options",
+    }
+    for name, value in payload.items():
+        if name not in converted and name not in body:
+            body[name] = value
     body.setdefault("include", ["reasoning.encrypted_content"])
     return body
 

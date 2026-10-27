@@ -1,4 +1,4 @@
-"""Validate supported fields before converting requests; never drop unknown options."""
+"""Validate the request envelope while preserving client-specific options."""
 
 from typing import Any, Literal
 
@@ -14,7 +14,10 @@ from pydantic import (
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # The gateway is a trusted internal relay. Keep fields added by clients so
+    # the upstream service, rather than this compatibility layer, can decide
+    # whether an option is supported.
+    model_config = ConfigDict(extra="allow")
 
 
 class Function(StrictModel):
@@ -98,7 +101,9 @@ class BaseProxyRequest(StrictModel):
     reasoning: dict[str, Any] | None = None
     metadata: dict[str, str] | None = None
     parallel_tool_calls: StrictBool | None = None
-    store: Literal[False] = False
+    store: bool = False
+    prompt_cache_key: str | None = Field(default=None, min_length=1, max_length=512)
+    client_metadata: dict[str, Any] | None = None
 
 
 class ChatRequest(BaseProxyRequest):
@@ -110,7 +115,7 @@ class ChatRequest(BaseProxyRequest):
     response_format: dict[str, Any] | None = None
     reasoning_effort: str | None = None
     stream_options: StreamOptions | None = None
-    n: Literal[1] = 1
+    n: int | None = Field(default=None, gt=0, strict=True)
 
     @model_validator(mode="after")
     def validate_options(self):
@@ -132,31 +137,15 @@ class ChatRequest(BaseProxyRequest):
             choice = self.tool_choice
             function = choice.get("function")
             if (
-                set(choice) != {"type", "function"}
-                or choice["type"] != "function"
+                choice.get("type") != "function"
                 or not isinstance(function, dict)
-                or set(function) != {"name"}
-                or not isinstance(function["name"], str)
+                or not isinstance(function.get("name"), str)
                 or not function["name"]
             ):
                 raise ValueError("tool_choice must select a named function")
         if self.response_format is not None:
             fmt = self.response_format
-            if fmt.get("type") in ("text", "json_object") and set(fmt) == {"type"}:
-                pass
-            elif (
-                fmt.get("type") == "json_schema"
-                and set(fmt) == {"type", "json_schema"}
-                and isinstance(fmt["json_schema"], dict)
-            ):
-                schema = fmt["json_schema"]
-                if (
-                    not isinstance(schema.get("name"), str)
-                    or not isinstance(schema.get("schema"), dict)
-                    or set(schema) - {"name", "schema", "strict", "description"}
-                ):
-                    raise ValueError("invalid json_schema response format")
-            else:
+            if not isinstance(fmt, dict):
                 raise ValueError("unsupported response_format")
         return self
 

@@ -32,7 +32,7 @@ Linux 部署统一使用 **WARP + Gateway**：一个 `docker-compose.yml` 启动
 | `GET /healthz` | 进程存活检查 |
 | `GET /readyz` | 数据库和上游凭证就绪检查；必要时刷新凭证，不发起模型推理 |
 
-Chat Completions 支持 `tools` / `tool_choice`、`parallel_tool_calls`、`temperature`、`reasoning` / `reasoning_effort`、`metadata`、`response_format`（text / json_object / json_schema）。`max_tokens`、`max_completion_tokens` 和 `max_output_tokens` 均映射为上游输出 token 上限，同一请求只能指定一个。
+Chat Completions 支持 `tools` / `tool_choice`、`parallel_tool_calls`、`temperature`、`reasoning` / `reasoning_effort`、`metadata`、`response_format`（text / json_object / json_schema）。`max_tokens`、`max_completion_tokens` 和 `max_output_tokens` 均映射为上游输出 token 上限，同一请求只能指定一个。网关会保留并透传客户端新增的顶层字段（例如 `prompt_cache_key`、`client_metadata` 和未来字段），不在本地维护完整的上游字段白名单；最终是否支持由上游返回结果决定。
 
 `stream=true` 会增量输出文本、拒绝内容和函数参数。Chat Completions 以 `[DONE]` 结束，可通过 `stream_options.include_usage=true` 获取最终用量；Responses 保留具名事件格式。流式开始前发现错误会返回错误 HTTP 状态；开始后的错误通过 SSE 传递，并在用量日志中记录失败状态。
 

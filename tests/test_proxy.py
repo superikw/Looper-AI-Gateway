@@ -82,8 +82,6 @@ async def upstream(monkeypatch):
             **BASE,
             "messages": [{"role": "user", "content": [{"type": "audio", "data": "x"}]}],
         },
-        {**BASE, "stop": ["END"]},
-        {**BASE, "n": 2},
     ],
 )
 async def test_invalid_payloads_are_400_and_audited(client, key, payload):
@@ -227,6 +225,21 @@ def test_images_tools_and_json_schema_are_converted():
     assert body["tool_choice"] == {"type": "function", "name": "weather"}
     assert body["max_output_tokens"] == 100
     assert body["text"]["format"]["name"] == "answer"
+
+
+def test_client_specific_fields_are_preserved_and_forwarded():
+    payload = {
+        "model": "gpt-6.1-sol",
+        "input": "hello",
+        "prompt_cache_key": "session-cache-key",
+        "client_metadata": {"session_id": "session-1", "origin": "codex"},
+        "future_option": {"enabled": True},
+    }
+    normalized = validate_proxy_payload("/v1/responses", payload)
+    body = build_codex_request_body("/v1/responses", normalized)
+    assert body["prompt_cache_key"] == "session-cache-key"
+    assert body["client_metadata"] == payload["client_metadata"]
+    assert body["future_option"] == payload["future_option"]
 
 
 async def test_nonstream_tool_calls_and_length_reason(client, key, upstream):
