@@ -1,5 +1,7 @@
 # Looper-AI-Gateway
 
+GitHub 仓库：https://github.com/superikw/Looper-AI-Gateway
+
 一个给 ChatGPT / Codex 登录态做二次分发的 Python Gateway。
 
 它做的事情很简单：
