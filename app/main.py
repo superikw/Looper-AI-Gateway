@@ -20,8 +20,13 @@ from app.config import settings
 from app.db import engine, get_db
 from app.http_client import close_http_client
 from app.migrations import initialize_database
-from app.models import ApiKey, OAuthSession, UpstreamCredential, User
-from app.oauth_manual import complete_oauth_session, start_oauth_session
+from app.models import ApiKey, OAuthSession, User
+from app.oauth_manual import (
+    active_upstream_credential_query,
+    complete_oauth_session,
+    logout_upstream_credentials,
+    start_oauth_session,
+)
 from app.oauth_schemas import OAuthCompleteRequest
 from app.proxy_schemas import validate_proxy_payload
 from app.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyOut, UserCreate, UserOut
@@ -228,17 +233,7 @@ async def usage_summary(db: AsyncSession = Depends(get_db)):
 async def get_upstream_auth_status(db: AsyncSession = Depends(get_db)):
     auth_state = await asyncio.to_thread(codex_auth_manager.login_status)
     latest_credential = None
-    cred = (
-        (
-            await db.execute(
-                select(UpstreamCredential)
-                .where(UpstreamCredential.provider == "codex")
-                .order_by(UpstreamCredential.id.desc())
-            )
-        )
-        .scalars()
-        .first()
-    )
+    cred = (await db.execute(active_upstream_credential_query())).scalars().first()
     if cred:
         latest_credential = {
             "id": cred.id,
@@ -335,34 +330,13 @@ async def admin_oauth_status(session_id: int, db: AsyncSession = Depends(get_db)
 
 @app.post("/admin/auth/codex/logout", dependencies=[Depends(require_admin)])
 async def admin_oauth_logout(db: AsyncSession = Depends(get_db)):
-    creds = (
-        (
-            await db.execute(
-                select(UpstreamCredential).where(UpstreamCredential.provider == "codex")
-            )
-        )
-        .scalars()
-        .all()
-    )
-    for cred in creds:
-        await db.delete(cred)
-    await db.commit()
-    return {"ok": True, "deleted_credentials": len(creds)}
+    count = await logout_upstream_credentials(db)
+    return {"ok": True, "deleted_credentials": count}
 
 
 @app.get("/admin/auth/codex/account", dependencies=[Depends(require_admin)])
 async def admin_oauth_account(db: AsyncSession = Depends(get_db)):
-    cred = (
-        (
-            await db.execute(
-                select(UpstreamCredential)
-                .where(UpstreamCredential.provider == "codex")
-                .order_by(UpstreamCredential.id.desc())
-            )
-        )
-        .scalars()
-        .first()
-    )
+    cred = (await db.execute(active_upstream_credential_query())).scalars().first()
     if not cred:
         return {"logged_in": False}
     return {

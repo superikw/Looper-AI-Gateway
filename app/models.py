@@ -81,6 +81,7 @@ class UpstreamCredential(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     provider: Mapped[str] = mapped_column(String(32), index=True)
     auth_mode: Mapped[str] = mapped_column(String(32), default="oauth_manual")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     access_token: Mapped[str] = mapped_column(EncryptedText())
     refresh_token: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     token_type: Mapped[str | None] = mapped_column(String(32), nullable=True)

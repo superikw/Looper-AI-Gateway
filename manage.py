@@ -15,7 +15,12 @@ from app.db import AsyncSessionLocal, engine
 from app.http_client import close_http_client
 from app.migrations import initialize_database
 from app.models import ApiKey, OAuthSession, UpstreamCredential, User
-from app.oauth_manual import complete_oauth_session, start_oauth_session
+from app.oauth_manual import (
+    active_upstream_credential_query,
+    complete_oauth_session,
+    logout_upstream_credentials,
+    start_oauth_session,
+)
 from app.utils import make_api_key, mask_key, sha256_text, utcnow
 
 
@@ -41,7 +46,11 @@ async def cmd_doctor(_: argparse.Namespace) -> None:
             await db.execute(select(func.count(OAuthSession.id)))
         ).scalar() or 0
         creds = (
-            await db.execute(select(func.count(UpstreamCredential.id)))
+            await db.execute(
+                select(func.count(UpstreamCredential.id)).where(
+                    UpstreamCredential.deleted_at.is_(None)
+                )
+            )
         ).scalar() or 0
     print_json(
         {
@@ -111,17 +120,7 @@ async def cmd_auth_status(args: argparse.Namespace) -> None:
             .scalars()
             .first()
         )
-        cred = (
-            (
-                await db.execute(
-                    select(UpstreamCredential)
-                    .where(UpstreamCredential.provider == "codex")
-                    .order_by(UpstreamCredential.id.desc())
-                )
-            )
-            .scalars()
-            .first()
-        )
+        cred = (await db.execute(active_upstream_credential_query())).scalars().first()
         print_json(
             {
                 "latest_session": None
@@ -153,21 +152,7 @@ async def cmd_auth_status(args: argparse.Namespace) -> None:
 async def cmd_logout(_: argparse.Namespace) -> None:
     await ensure_db()
     async with AsyncSessionLocal() as db:
-        creds = (
-            (
-                await db.execute(
-                    select(UpstreamCredential).where(
-                        UpstreamCredential.provider == "codex"
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        count = len(creds)
-        for cred in creds:
-            await db.delete(cred)
-        await db.commit()
+        count = await logout_upstream_credentials(db)
     print_json({"ok": True, "deleted_credentials": count})
 
 
@@ -359,9 +344,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-id", type=int)
     p.set_defaults(func=cmd_auth_status)
 
-    sub.add_parser("logout", help="Delete stored upstream credential").set_defaults(
-        func=cmd_logout
-    )
+    sub.add_parser(
+        "logout", help="Soft-delete stored upstream credentials"
+    ).set_defaults(func=cmd_logout)
 
     p = sub.add_parser("create-user", help="Create a new user")
     p.add_argument("name")

@@ -80,6 +80,23 @@ async def initialize_database() -> None:
             await conn.execute(
                 text("ALTER TABLE api_keys ADD COLUMN deleted_at DATETIME")
             )
+        credential_columns = await conn.run_sync(
+            lambda c: {
+                col["name"] for col in inspect(c).get_columns("upstream_credentials")
+            }
+        )
+        if "deleted_at" not in credential_columns:
+            await conn.execute(
+                text("ALTER TABLE upstream_credentials ADD COLUMN deleted_at DATETIME")
+            )
+        if not (
+            await conn.execute(
+                text("SELECT version FROM schema_migrations WHERE version = 3")
+            )
+        ).first():
+            await conn.execute(
+                text("INSERT INTO schema_migrations (version) VALUES (3)")
+            )
         if not (
             await conn.execute(
                 text("SELECT version FROM schema_migrations WHERE version = 1")

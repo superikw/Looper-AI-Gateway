@@ -128,3 +128,29 @@ async def test_wrong_key_rolls_back_previous_migration_batches():
             )
             == "access-0"
         )
+
+
+async def test_legacy_credentials_gain_soft_delete_column_without_data_loss():
+    await insert_credentials(2)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("ALTER TABLE upstream_credentials DROP COLUMN deleted_at")
+        )
+    await initialize_database()
+    await initialize_database()
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT access_token, deleted_at FROM upstream_credentials ORDER BY id"
+                )
+            )
+        ).all()
+        assert [decrypt(row.access_token) for row in rows] == ["access-0", "access-1"]
+        assert all(row.deleted_at is None for row in rows)
+        assert (
+            await conn.scalar(
+                text("SELECT count(*) FROM schema_migrations WHERE version = 3")
+            )
+            == 1
+        )

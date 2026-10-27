@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -20,6 +20,41 @@ from app.models import OAuthSession, UpstreamCredential
 from app.utils import utcnow
 
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
+
+
+def active_upstream_credential_query():
+    return (
+        select(UpstreamCredential)
+        .where(
+            UpstreamCredential.provider == "codex",
+            UpstreamCredential.deleted_at.is_(None),
+        )
+        .order_by(UpstreamCredential.id.desc())
+        .limit(1)
+    )
+
+
+async def logout_upstream_credentials(db: AsyncSession) -> int:
+    try:
+        async with database_lock(
+            "oauth-refresh", settings.upstream_timeout_seconds + 5
+        ):
+            now = _now()
+            result = await db.execute(
+                update(UpstreamCredential)
+                .where(
+                    UpstreamCredential.provider == "codex",
+                    UpstreamCredential.deleted_at.is_(None),
+                )
+                .values(deleted_at=now, updated_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            await db.commit()
+            return result.rowcount
+    except TimeoutError:
+        raise HTTPException(
+            504, "Timed out waiting to log out upstream credentials"
+        ) from None
 
 
 @dataclass
@@ -184,33 +219,40 @@ async def complete_oauth_session(
     expires_at = _now() + timedelta(seconds=expires_in)
     account_id = extract_account_id(access_token, token_data)
 
-    existing = await db.execute(
-        select(UpstreamCredential)
-        .where(UpstreamCredential.provider == "codex")
-        .order_by(UpstreamCredential.id.desc())
-    )
-    current = existing.scalars().first()
-    if not current:
-        current = UpstreamCredential(provider="codex")
-        db.add(current)
+    try:
+        async with database_lock(
+            "oauth-refresh", settings.upstream_timeout_seconds + 5
+        ):
+            await db.refresh(entity)
+            if entity.status != "pending":
+                raise HTTPException(409, f"oauth session already {entity.status}")
+            existing = await db.execute(active_upstream_credential_query())
+            current = existing.scalars().first()
+            if not current:
+                current = UpstreamCredential(provider="codex")
+                db.add(current)
 
-    current.auth_mode = "oauth_manual"
-    current.access_token = access_token
-    current.refresh_token = refresh_token
-    current.token_type = token_data.get("token_type", "Bearer")
-    current.scope = token_data.get("scope")
-    current.expires_at = expires_at
-    current.account_id = account_id
-    current.raw_json = json.dumps(token_data, ensure_ascii=False)
-    current.updated_at = _now()
+            current.auth_mode = "oauth_manual"
+            current.access_token = access_token
+            current.refresh_token = refresh_token
+            current.token_type = token_data.get("token_type", "Bearer")
+            current.scope = token_data.get("scope")
+            current.expires_at = expires_at
+            current.account_id = account_id
+            current.raw_json = json.dumps(token_data, ensure_ascii=False)
+            current.updated_at = _now()
 
-    entity.status = "completed"
-    entity.callback_url = "received"
-    entity.code_verifier = ""
-    entity.completed_at = _now()
+            entity.status = "completed"
+            entity.callback_url = "received"
+            entity.code_verifier = ""
+            entity.completed_at = _now()
 
-    await db.commit()
-    await db.refresh(current)
+            await db.commit()
+            await db.refresh(current)
+    except TimeoutError:
+        raise HTTPException(
+            504, "Timed out waiting to store upstream credentials"
+        ) from None
     return {
         "ok": True,
         "session_id": session_id,
@@ -240,6 +282,10 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> dict[str, An
 async def refresh_upstream_credential(
     db: AsyncSession, credential: UpstreamCredential
 ) -> UpstreamCredential:
+    if credential.deleted_at is not None:
+        raise HTTPException(
+            401, "upstream credential has been logged out; please login again"
+        )
     if not credential.refresh_token:
         raise HTTPException(
             status_code=401,
@@ -273,11 +319,7 @@ async def refresh_upstream_credential(
 
 
 async def get_active_upstream_credential(db: AsyncSession) -> UpstreamCredential | None:
-    result = await db.execute(
-        select(UpstreamCredential)
-        .where(UpstreamCredential.provider == "codex")
-        .order_by(UpstreamCredential.id.desc())
-    )
+    result = await db.execute(active_upstream_credential_query())
     credential = result.scalars().first()
     if not credential:
         return None
@@ -290,6 +332,8 @@ async def get_active_upstream_credential(db: AsyncSession) -> UpstreamCredential
             ):
                 # Another process may have refreshed while this request waited.
                 await db.refresh(credential)
+                if credential.deleted_at is not None:
+                    return None
                 if (
                     credential.expires_at
                     and credential.expires_at <= _now() + timedelta(seconds=90)
