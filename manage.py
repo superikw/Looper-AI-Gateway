@@ -16,6 +16,7 @@ from app.config import settings
 from app.db import AsyncSessionLocal, engine
 from app.http_client import close_http_client
 from app.migrations import initialize_database
+from app.model_policy import block_model, list_blocked_models, unblock_model
 from app.models import ApiKey, OAuthSession, UpstreamCredential, User
 from app.oauth_manual import (
     active_upstream_credential_query,
@@ -23,7 +24,7 @@ from app.oauth_manual import (
     logout_upstream_credentials,
     start_oauth_session,
 )
-from app.schemas import UpstreamAccountUpdate
+from app.schemas import ModelBlockOut, UpstreamAccountUpdate
 from app.upstreams import list_accounts, update_account, validate_binding
 from app.utils import make_api_key, mask_key, sha256_text, utcnow
 
@@ -39,6 +40,30 @@ async def ensure_db() -> None:
 
 async def cmd_generate_admin_token(_: argparse.Namespace) -> None:
     print(secrets.token_hex(32))
+
+
+async def cmd_list_blocked_models(_: argparse.Namespace) -> None:
+    await ensure_db()
+    async with AsyncSessionLocal() as db:
+        print_json(
+            [
+                ModelBlockOut.model_validate(item).model_dump(mode="json")
+                for item in await list_blocked_models(db)
+            ]
+        )
+
+
+async def cmd_block_model(args: argparse.Namespace) -> None:
+    await ensure_db()
+    async with AsyncSessionLocal() as db:
+        item = await block_model(db, args.model)
+        print_json(ModelBlockOut.model_validate(item).model_dump(mode="json"))
+
+
+async def cmd_unblock_model(args: argparse.Namespace) -> None:
+    await ensure_db()
+    async with AsyncSessionLocal() as db:
+        print_json({"ok": True, "model": await unblock_model(db, args.model)})
 
 
 async def cmd_doctor(_: argparse.Namespace) -> None:
@@ -381,6 +406,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "generate-admin-token", help="Generate a strong ADMIN_TOKEN"
     ).set_defaults(func=cmd_generate_admin_token)
+    sub.add_parser("list-blocked-models", help="List the model blacklist").set_defaults(
+        func=cmd_list_blocked_models
+    )
+    p = sub.add_parser("block-model", help="Block a model immediately")
+    p.add_argument("model")
+    p.set_defaults(func=cmd_block_model)
+    p = sub.add_parser("unblock-model", help="Remove a model from the blacklist")
+    p.add_argument("model")
+    p.set_defaults(func=cmd_unblock_model)
     sub.add_parser(
         "auth-start", help="Start OAuth login and print auth_url"
     ).set_defaults(func=cmd_auth_start)

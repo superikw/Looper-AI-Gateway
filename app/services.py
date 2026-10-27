@@ -9,7 +9,7 @@ from typing import Any
 
 import anyio
 import httpx
-from fastapi import HTTPException, Request, status
+from fastapi import HTTPException, Request
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +17,6 @@ from app.codex_auth import CodexAuthError, codex_auth_manager
 from app.config import settings
 from app.db import AsyncSessionLocal
 from app.http_client import ProxyTransportError, get_http_client, proxy_transport_error
-from app.model_utils import canonicalize_model_name
 from app.models import ApiKey, UpstreamCredential, UsageLog
 from app.oauth_manual import get_active_upstream_credential
 from app.protocol import (
@@ -459,19 +458,6 @@ async def record_usage(
         )
     )
     await db.commit()
-
-
-def validate_model(model: str | None) -> str | None:
-    if not isinstance(model, str) or not model.strip():
-        raise HTTPException(400, "model must be a non-empty string")
-    normalized_model = canonicalize_model_name(model)
-    allowed = settings.allowed_models
-    if allowed and normalized_model and normalized_model not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"model not allowed: {model}",
-        )
-    return normalized_model
 
 
 async def parse_request_json(request: Request) -> dict[str, Any]:

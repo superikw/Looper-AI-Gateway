@@ -63,9 +63,9 @@ class Settings(BaseSettings):
     default_instructions: str = Field(
         default="You are a helpful assistant.", alias="DEFAULT_INSTRUCTIONS"
     )
-    default_allowed_models: str = Field(
-        default="gpt-5.5,gpt-5.4,gpt-5.3,gpt-5.1-codex-mini,gpt-5.3-codex",
-        alias="DEFAULT_ALLOWED_MODELS",
+    model_catalog: str = Field(
+        default="gpt-6.1-sol",
+        alias="MODEL_CATALOG",
     )
 
     oauth_authorize_url: str = Field(
@@ -137,10 +137,8 @@ class Settings(BaseSettings):
         return len(self.admin_token.strip()) >= 32
 
     @property
-    def allowed_models(self) -> list[str]:
-        if not self.default_allowed_models.strip():
-            return []
-        return normalize_model_list(self.default_allowed_models.split(","))
+    def catalog_models(self) -> list[str]:
+        return normalize_model_list(self.model_catalog.split(","))
 
 
 settings = Settings()

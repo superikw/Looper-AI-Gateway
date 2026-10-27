@@ -10,6 +10,13 @@ from app.db import Base
 from app.utils import utcnow
 
 
+class BlockedModel(Base):
+    __tablename__ = "blocked_models"
+
+    model: Mapped[str] = mapped_column(String(128), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class User(Base):
     __tablename__ = "users"
 

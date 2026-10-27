@@ -129,6 +129,9 @@ async def initialize_database() -> None:
         await conn.execute(
             text("INSERT OR IGNORE INTO schema_migrations (version) VALUES (5)")
         )
+        await conn.execute(
+            text("INSERT OR IGNORE INTO schema_migrations (version) VALUES (6)")
+        )
         if not (
             await conn.execute(
                 text("SELECT version FROM schema_migrations WHERE version = 4")

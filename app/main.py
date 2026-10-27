@@ -20,6 +20,13 @@ from app.config import settings
 from app.db import engine, get_db
 from app.http_client import close_http_client
 from app.migrations import initialize_database
+from app.model_policy import (
+    block_model,
+    enforce_model_policy,
+    list_blocked_models,
+    unblock_model,
+    validate_model,
+)
 from app.models import ApiKey, OAuthSession, User
 from app.oauth_manual import (
     active_upstream_credential_query,
@@ -34,6 +41,8 @@ from app.schemas import (
     ApiKeyCreate,
     ApiKeyCreated,
     ApiKeyOut,
+    ModelBlockCreate,
+    ModelBlockOut,
     UpstreamAccountUpdate,
     UserCreate,
     UserOut,
@@ -44,7 +53,6 @@ from app.services import (
     record_usage,
     resolve_upstream_bearer_token,
     resolve_upstream_credential,
-    validate_model,
 )
 from app.streaming import stream_to_upstream
 from app.token_utils import extract_account_id_from_token
@@ -209,6 +217,31 @@ async def patch_upstream(
         raise HTTPException(400, "enabled must be a boolean")
     await update_account(db, credential_id, changes)
     return {"ok": True, "id": credential_id}
+
+
+@app.get(
+    "/admin/models/blacklist",
+    dependencies=[Depends(require_admin)],
+    response_model=list[ModelBlockOut],
+)
+async def model_blacklist(db: AsyncSession = Depends(get_db)):
+    return await list_blocked_models(db)
+
+
+@app.post(
+    "/admin/models/blacklist",
+    dependencies=[Depends(require_admin)],
+    response_model=ModelBlockOut,
+)
+async def add_blocked_model(
+    payload: ModelBlockCreate, db: AsyncSession = Depends(get_db)
+):
+    return await block_model(db, payload.model)
+
+
+@app.delete("/admin/models/blacklist", dependencies=[Depends(require_admin)])
+async def remove_blocked_model(model: str, db: AsyncSession = Depends(get_db)):
+    return {"ok": True, "model": await unblock_model(db, model)}
 
 
 @app.delete("/admin/upstreams/{credential_id}", dependencies=[Depends(require_admin)])
@@ -419,6 +452,7 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
     try:
         payload = validate_proxy_payload(path, await parse_request_json(request))
         model = validate_model(payload["model"])
+        await enforce_model_policy(db, model)
         payload["model"] = model
         if payload["stream"]:
             return await stream_to_upstream(path, payload, db, api_key)
@@ -475,8 +509,15 @@ async def proxy_models_post():
 
 
 @app.get("/v1/models")
-async def list_models(api_key: ApiKey = Depends(require_api_key)):
-    items = [{"id": m, "object": "model"} for m in settings.allowed_models]
+async def list_models(
+    api_key: ApiKey = Depends(require_api_key), db: AsyncSession = Depends(get_db)
+):
+    blocked = {item.model for item in await list_blocked_models(db)}
+    items = [
+        {"id": m, "object": "model"}
+        for m in settings.catalog_models
+        if m not in blocked
+    ]
     return {"object": "list", "data": items}
 
 

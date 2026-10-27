@@ -5,6 +5,17 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
+class ModelBlockCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model: str = Field(min_length=1, max_length=128)
+
+
+class ModelBlockOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    model: str
+    created_at: datetime
+
+
 class UserCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     note: str | None = Field(default=None, max_length=255)
