@@ -31,7 +31,7 @@ async def test_readiness_matches_forwarding_requirements(
     from fastapi import HTTPException
 
     from app.config import settings
-    from app.services import open_upstream
+    from app.services import close_upstream, open_upstream
     from app.token_utils import JWT_CLAIM_PATH
 
     token = (
@@ -69,7 +69,7 @@ async def test_readiness_matches_forwarding_requirements(
             }
             if has_account:
                 response = await open_upstream("/v1/chat/completions", payload, db)
-                await response.aclose()
+                await close_upstream(response)
                 assert requests[0].headers["chatgpt-account-id"] == "routing-account"
             else:
                 with pytest.raises(HTTPException) as error:

@@ -64,6 +64,12 @@ async def test_login_keeps_different_accounts_and_updates_same_account(
     monkeypatch.setattr("app.oauth_manual.exchange_code_for_token", exchange)
     first = await login(client, "first", "Work")
     second = await login(client, "second", "Personal")
+    changed = await client.patch(
+        f"/admin/upstreams/{first.json()['credential_id']}",
+        headers=ADMIN,
+        json={"max_rpm": 17, "max_concurrency": 2, "min_interval_seconds": 0.5},
+    )
+    assert changed.status_code == 200
     again = await login(client, "first", "Updated Work")
     assert first.status_code == second.status_code == again.status_code == 200
     assert first.json()["credential_id"] == again.json()["credential_id"]
@@ -73,6 +79,11 @@ async def test_login_keeps_different_accounts_and_updates_same_account(
         work = await db.get(UpstreamCredential, first.json()["credential_id"])
         personal = await db.get(UpstreamCredential, second.json()["credential_id"])
         assert work.name == "Updated Work"
+        assert (work.max_rpm, work.max_concurrency, work.min_interval_seconds) == (
+            17,
+            2,
+            0.5,
+        )
         assert work.access_token == "access-secret-3"
         assert personal.access_token == "access-secret-2"
     listed = await client.get("/admin/upstreams", headers=ADMIN)
@@ -428,10 +439,19 @@ async def test_claims_are_balanced_under_concurrency_and_persist(accounts):
     from app.db import engine
     from app.upstreams import claim_account
 
-    claims = await asyncio.gather(*(claim_account(None, set()) for _ in range(20)))
+    async def claim_and_release():
+        lease = await claim_account(None, set())
+        try:
+            return lease.credential_id
+        finally:
+            await lease.release()
+
+    claims = await asyncio.gather(*(claim_and_release() for _ in range(20)))
     assert claims.count(accounts[0]) == claims.count(accounts[1]) == 10
     await engine.dispose()
-    assert await claim_account(None, set()) == accounts[0]
+    lease = await claim_account(None, set())
+    assert lease.credential_id == accounts[0]
+    await lease.release()
 
 
 async def test_late_failure_does_not_shorten_rate_limit_cooldown(accounts):
@@ -451,7 +471,11 @@ import asyncio, json
 from app.upstreams import claim_account
 from app.db import engine
 async def run():
-    claims = [await claim_account(None, set()) for _ in range(6)]
+    claims = []
+    for _ in range(6):
+        lease = await claim_account(None, set())
+        claims.append(lease.credential_id)
+        await lease.release()
     await engine.dispose()
     print(json.dumps(claims))
 asyncio.run(run())

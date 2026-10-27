@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.config import settings
@@ -22,6 +23,7 @@ from app.oauth_manual import (
     logout_upstream_credentials,
     start_oauth_session,
 )
+from app.schemas import UpstreamAccountUpdate
 from app.upstreams import list_accounts, update_account, validate_binding
 from app.utils import make_api_key, mask_key, sha256_text, utcnow
 
@@ -177,6 +179,11 @@ async def cmd_update_upstream(args: argparse.Namespace) -> None:
         changes["name"] = args.name
     if args.enabled is not None:
         changes["enabled"] = args.enabled
+    for field in ("max_rpm", "max_concurrency", "min_interval_seconds"):
+        value = getattr(args, field, None)
+        if value is not None:
+            changes[field] = value
+    changes = UpstreamAccountUpdate(**changes).model_dump(exclude_unset=True)
     async with AsyncSessionLocal() as db:
         await update_account(db, args.credential_id, changes)
     print_json({"ok": True, "id": args.credential_id})
@@ -405,6 +412,9 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--enable", dest="enabled", action="store_const", const=True)
     group.add_argument("--disable", dest="enabled", action="store_const", const=False)
     p.add_argument("--reset-cooldown", action="store_true")
+    p.add_argument("--max-rpm", type=int)
+    p.add_argument("--max-concurrency", type=int)
+    p.add_argument("--min-interval-seconds", type=float)
     p.set_defaults(func=cmd_update_upstream, enabled=None)
 
     p = sub.add_parser("create-user", help="Create a new user")
@@ -456,6 +466,8 @@ async def amain() -> None:
         await args.func(args)
     except HTTPException as exc:
         raise SystemExit(f"{exc.status_code}: {exc.detail}") from None
+    except ValidationError as exc:
+        raise SystemExit(str(exc)) from None
     finally:
         await close_http_client()
         await engine.dispose()

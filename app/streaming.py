@@ -18,6 +18,7 @@ from app.protocol import (
 )
 from app.services import (
     account_id_for_response,
+    close_upstream,
     format_upstream_result,
     iter_upstream_events,
     open_upstream,
@@ -201,7 +202,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                     await mark_account_failure(
                         cid, settings.upstream_failure_cooldown_seconds
                     )
-                await response.aclose()
+                await close_upstream(response)
                 await record_usage(
                     db, api_key, path, payload["model"], code, result, rid, cid
                 )
@@ -220,14 +221,14 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
         if first is None or (initial.terminal and response_failed(initial.result())):
             code, result = format_upstream_result(path, payload, 200, initial.result())
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
-            await response.aclose()
+            await close_upstream(response)
             await record_usage(
                 db, api_key, path, payload["model"], code, result, rid, cid
             )
             return JSONResponse(result, status_code=code)
     except BaseException as exc:
         with anyio.CancelScope(shield=True):
-            await response.aclose()
+            await close_upstream(response)
             if isinstance(exc, HTTPException):
                 exc.upstream_credential_id = cid
                 if response.status_code < 400:
@@ -254,7 +255,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
         # FastAPI may close the request-scoped DB session before streaming.
         # A fresh session and a cancellation shield preserve the final audit row.
         with anyio.CancelScope(shield=True):
-            await response.aclose()
+            await close_upstream(response)
             if state["code"] >= 400 and state["code"] != 499:
                 await mark_account_failure(
                     cid, settings.upstream_failure_cooldown_seconds

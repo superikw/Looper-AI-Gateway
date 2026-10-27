@@ -27,7 +27,21 @@ async def test_cli_manages_accounts_and_binding(key, capsys):
     listed = json.loads(capsys.readouterr().out)
     assert [row["id"] for row in listed] == [first, second]
     assert "secret" not in str(listed)
-    await run(["update-upstream", str(first), "--disable", "--name", "Paused"])
+    await run(
+        [
+            "update-upstream",
+            str(first),
+            "--disable",
+            "--name",
+            "Paused",
+            "--max-rpm",
+            "45",
+            "--max-concurrency",
+            "2",
+            "--min-interval-seconds",
+            "0.5",
+        ]
+    )
     await run(["bind-key", str(key.id), "--upstream-id", str(first)])
     await run(
         [
@@ -46,6 +60,11 @@ async def test_cli_manages_accounts_and_binding(key, capsys):
         assert new.upstream_credential_id == second
         account = await db.get(UpstreamCredential, first)
         assert account.name == "Paused" and not account.enabled
+        assert (
+            account.max_rpm,
+            account.max_concurrency,
+            account.min_interval_seconds,
+        ) == (45, 2, 0.5)
     await run(["bind-key", str(key.id), "--auto"])
     await run(["logout", "--credential-id", str(first)])
     async with AsyncSessionLocal() as db:

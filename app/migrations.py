@@ -92,8 +92,12 @@ async def initialize_database() -> None:
         additions = {
             "name": "VARCHAR(128)",
             "enabled": "BOOLEAN NOT NULL DEFAULT 1",
+            "max_rpm": "INTEGER NOT NULL DEFAULT 30",
+            "max_concurrency": "INTEGER NOT NULL DEFAULT 4",
+            "min_interval_seconds": "FLOAT NOT NULL DEFAULT 0",
             "cooldown_until": "DATETIME",
             "last_used_at": "DATETIME",
+            "last_dispatched_at": "DATETIME",
             "request_count": "INTEGER NOT NULL DEFAULT 0",
             "failure_count": "INTEGER NOT NULL DEFAULT 0",
             "prompt_tokens": "INTEGER NOT NULL DEFAULT 0",
@@ -121,6 +125,9 @@ async def initialize_database() -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_usage_logs_upstream_credential_id ON usage_logs (upstream_credential_id)"
             )
+        )
+        await conn.execute(
+            text("INSERT OR IGNORE INTO schema_migrations (version) VALUES (5)")
         )
         if not (
             await conn.execute(

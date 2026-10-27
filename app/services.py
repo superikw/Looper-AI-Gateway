@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
+import anyio
 import httpx
 from fastapi import HTTPException, Request, status
 from sqlalchemy import update
@@ -29,7 +31,7 @@ from app.protocol import (
     validate_upstream_data,
 )
 from app.token_utils import extract_account_id_from_token
-from app.upstreams import claim_account, mark_account_failure
+from app.upstreams import AccountLease, mark_account_failure, wait_for_account
 
 
 def log_debug(event: str, **kwargs: Any) -> None:
@@ -83,6 +85,32 @@ def network_error(exc: httpx.RequestError) -> HTTPException:
 
 def account_id_for_response(response: httpx.Response) -> int | None:
     return response.extensions.get("gateway_credential_id")
+
+
+class LeasedStream(httpx.AsyncByteStream):
+    def __init__(self, stream: httpx.AsyncByteStream, lease: AccountLease):
+        self.stream, self.lease = stream, lease
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self):
+        try:
+            await self.stream.aclose()
+        finally:
+            await self.lease.release()
+
+
+async def close_upstream(response: httpx.Response) -> None:
+    # Cached/mock responses may already be closed before the lease is attached.
+    with anyio.CancelScope(shield=True):
+        try:
+            await response.aclose()
+        finally:
+            lease = response.extensions.get("gateway_account_lease")
+            if lease is not None:
+                await lease.release()
 
 
 def cooldown_for_response(response: httpx.Response) -> int:
@@ -159,64 +187,97 @@ async def open_upstream(
     attempts = (
         1 if upstream_credential_id is not None else settings.upstream_max_attempts
     )
+    deadline = (
+        asyncio.get_running_loop().time() + settings.upstream_capacity_wait_seconds
+    )
     for attempt in range(attempts):
         try:
-            cid = await claim_account(upstream_credential_id, excluded)
+            lease = await wait_for_account(upstream_credential_id, excluded, deadline)
         except TimeoutError:
             raise HTTPException(503, "upstream account scheduler is busy") from None
-        if cid is None:
-            break
-        excluded.add(cid)
-        try:
-            async with AsyncSessionLocal() as credential_db:
-                credential = await get_active_upstream_credential(credential_db, cid)
-                if not credential:
-                    raise HTTPException(503, "selected upstream account is unavailable")
-                bearer = credential.access_token
-                account = credential.account_id or extract_account_id_from_token(bearer)
-                if not account:
-                    raise HTTPException(
-                        502, "upstream credential does not contain a ChatGPT account ID"
-                    )
         except HTTPException as exc:
-            exc.upstream_credential_id = cid
-            last_error = exc
-            await mark_account_failure(
-                cid,
-                300
-                if exc.status_code == 401
-                else settings.upstream_failure_cooldown_seconds,
-            )
-            continue
+            if upstream_credential_id is not None:
+                exc.upstream_credential_id = upstream_credential_id
+            raise
+        if lease is None:
+            break
+        cid = lease.credential_id
+        excluded.add(cid)
+        response = None
+        handed_off = False
         try:
-            response = await _send_upstream(path, body, bearer, account)
-        except httpx.RequestError as exc:
-            error = network_error(exc)
-            error.upstream_credential_id = cid
-            await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
-            # Only connection failures guarantee the model never received the
-            # request. A read/write timeout may already have consumed tokens.
-            if isinstance(
-                exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
-            ):
-                last_error = error
+            try:
+                async with AsyncSessionLocal() as credential_db:
+                    credential = await get_active_upstream_credential(
+                        credential_db, cid
+                    )
+                    if not credential:
+                        raise HTTPException(
+                            503, "selected upstream account is unavailable"
+                        )
+                    bearer = credential.access_token
+                    account = credential.account_id or extract_account_id_from_token(
+                        bearer
+                    )
+                    if not account:
+                        raise HTTPException(
+                            502,
+                            "upstream credential does not contain a ChatGPT account ID",
+                        )
+            except HTTPException as exc:
+                exc.upstream_credential_id = cid
+                last_error = exc
+                await mark_account_failure(
+                    cid,
+                    300
+                    if exc.status_code == 401
+                    else settings.upstream_failure_cooldown_seconds,
+                )
                 continue
-            raise error from None
-        response.extensions["gateway_credential_id"] = cid
-        if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
-            return response
-        await mark_account_failure(cid, cooldown_for_response(response))
-        if attempt == attempts - 1:
-            return response
-        try:
-            await response.aread()
-        except httpx.RequestError as exc:
-            error = network_error(exc)
-            error.upstream_credential_id = cid
-            raise error from None
+            try:
+                await lease.start_request(deadline)
+            except HTTPException as exc:
+                exc.upstream_credential_id = cid
+                last_error = exc
+                continue
+            try:
+                response = await _send_upstream(path, body, bearer, account)
+            except httpx.RequestError as exc:
+                error = network_error(exc)
+                error.upstream_credential_id = cid
+                await mark_account_failure(
+                    cid, settings.upstream_failure_cooldown_seconds
+                )
+                # Read/write failures may occur after the model received input.
+                if isinstance(
+                    exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+                ):
+                    last_error = error
+                    continue
+                raise error from None
+            response.extensions["gateway_credential_id"] = cid
+            response.extensions["gateway_account_lease"] = lease
+            response.stream = LeasedStream(response.stream, lease)
+            if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
+                handed_off = True
+                return response
+            await mark_account_failure(cid, cooldown_for_response(response))
+            if attempt == attempts - 1:
+                handed_off = True
+                return response
+            try:
+                await response.aread()
+            except httpx.RequestError as exc:
+                error = network_error(exc)
+                error.upstream_credential_id = cid
+                raise error from None
+            last_response = response
         finally:
-            await response.aclose()
-        last_response = response
+            if not handed_off:
+                if response is not None:
+                    await close_upstream(response)
+                else:
+                    await lease.release()
     if last_response is not None:
         return last_response
     if last_error is not None:
@@ -319,7 +380,7 @@ async def forward_to_upstream(
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
         raise
     finally:
-        await response.aclose()
+        await close_upstream(response)
 
 
 async def record_usage(

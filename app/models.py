@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.crypto import EncryptedText
@@ -90,8 +90,14 @@ class UpstreamCredential(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    max_rpm: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=4, server_default="4")
+    min_interval_seconds: Mapped[float] = mapped_column(
+        Float, default=0, server_default="0"
+    )
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     request_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     failure_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
@@ -108,3 +114,15 @@ class UpstreamCredential(Base):
     raw_json: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class UpstreamRequest(Base):
+    __tablename__ = "upstream_requests"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    upstream_credential_id: Mapped[int] = mapped_column(
+        ForeignKey("upstream_credentials.id"), index=True
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    dispatched: Mapped[bool] = mapped_column(Boolean, default=False)

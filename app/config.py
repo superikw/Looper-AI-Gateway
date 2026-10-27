@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     upstream_rate_limit_cooldown_seconds: int = Field(
         default=60, alias="UPSTREAM_RATE_LIMIT_COOLDOWN_SECONDS", ge=1, le=86400
     )
+    upstream_capacity_wait_seconds: float = Field(
+        default=15, alias="UPSTREAM_CAPACITY_WAIT_SECONDS", ge=0, le=120
+    )
     max_request_bytes: int = Field(
         default=16 * 1024 * 1024, alias="MAX_REQUEST_BYTES", gt=0
     )

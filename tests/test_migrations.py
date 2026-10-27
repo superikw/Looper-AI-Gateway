@@ -162,8 +162,12 @@ async def test_upgrade_adds_pool_fields_and_preserves_legacy_data(key):
         for field in (
             "name",
             "enabled",
+            "max_rpm",
+            "max_concurrency",
+            "min_interval_seconds",
             "cooldown_until",
             "last_used_at",
+            "last_dispatched_at",
             "request_count",
             "failure_count",
             "prompt_tokens",
@@ -173,6 +177,7 @@ async def test_upgrade_adds_pool_fields_and_preserves_legacy_data(key):
             await conn.execute(
                 text(f"ALTER TABLE upstream_credentials DROP COLUMN {field}")
             )
+        await conn.execute(text("DROP TABLE upstream_requests"))
         await conn.execute(text("DROP INDEX ix_usage_logs_upstream_credential_id"))
         # SQLite cannot DROP a column referenced by a table-level FK.
         # Rebuild the pre-pool schema while preserving its keys and data.
@@ -218,6 +223,18 @@ async def test_upgrade_adds_pool_fields_and_preserves_legacy_data(key):
         )
         assert decrypt(row["access_token"]) == "access-0"
         assert row["enabled"] == 1
+        assert (
+            row["max_rpm"],
+            row["max_concurrency"],
+            row["min_interval_seconds"],
+        ) == (30, 4, 0)
+        assert (
+            await conn.scalar(
+                text("SELECT count(*) FROM schema_migrations WHERE version = 5")
+            )
+            == 1
+        )
+        assert await conn.scalar(text("SELECT count(*) FROM upstream_requests")) == 0
         assert row["name"] is None and row["cooldown_until"] is None
         assert row["request_count"] == row["total_tokens"] == row["failure_count"] == 0
         saved = (await conn.execute(text("SELECT * FROM api_keys"))).mappings().one()

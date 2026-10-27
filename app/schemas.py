@@ -61,4 +61,9 @@ class UpstreamAccountUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=128)
     enabled: StrictBool | None = None
+    max_rpm: int = Field(default=30, strict=True, ge=1, le=100000)
+    max_concurrency: int = Field(default=4, strict=True, ge=1, le=10000)
+    min_interval_seconds: float = Field(
+        default=0, strict=True, ge=0, le=3600, allow_inf_nan=False
+    )
     reset_cooldown: StrictBool = False
