@@ -154,3 +154,78 @@ async def test_legacy_credentials_gain_soft_delete_column_without_data_loss():
             )
             == 1
         )
+
+
+async def test_upgrade_adds_pool_fields_and_preserves_legacy_data(key):
+    await insert_credentials(1)
+    async with engine.begin() as conn:
+        for field in (
+            "name",
+            "enabled",
+            "cooldown_until",
+            "last_used_at",
+            "request_count",
+            "failure_count",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+        ):
+            await conn.execute(
+                text(f"ALTER TABLE upstream_credentials DROP COLUMN {field}")
+            )
+        await conn.execute(text("DROP INDEX ix_usage_logs_upstream_credential_id"))
+        # SQLite cannot DROP a column referenced by a table-level FK.
+        # Rebuild the pre-pool schema while preserving its keys and data.
+        for table in ("api_keys", "usage_logs"):
+            ddl = await conn.scalar(
+                text(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :name"
+                ),
+                {"name": table},
+            )
+            ddl = "\n".join(
+                line
+                for line in ddl.splitlines()
+                if "upstream_credential_id" not in line
+            )
+            ddl = ddl.rstrip()[:-1].rstrip().rstrip(",") + "\n)"
+            ddl = ddl.replace(
+                f"CREATE TABLE {table}", f"CREATE TABLE legacy_{table}", 1
+            )
+            await conn.execute(text(ddl))
+            columns = [
+                row[1]
+                for row in await conn.execute(text(f"PRAGMA table_info({table})"))
+                if row[1] != "upstream_credential_id"
+            ]
+            names = ", ".join(columns)
+            await conn.execute(
+                text(
+                    f"INSERT INTO legacy_{table} ({names}) SELECT {names} FROM {table}"
+                )
+            )
+        await conn.execute(text("DROP TABLE usage_logs"))
+        await conn.execute(text("DROP TABLE api_keys"))
+        for table in ("api_keys", "usage_logs"):
+            await conn.execute(text(f"ALTER TABLE legacy_{table} RENAME TO {table}"))
+    await initialize_database()
+    await initialize_database()
+    async with engine.connect() as conn:
+        row = (
+            (await conn.execute(text("SELECT * FROM upstream_credentials")))
+            .mappings()
+            .one()
+        )
+        assert decrypt(row["access_token"]) == "access-0"
+        assert row["enabled"] == 1
+        assert row["name"] is None and row["cooldown_until"] is None
+        assert row["request_count"] == row["total_tokens"] == row["failure_count"] == 0
+        saved = (await conn.execute(text("SELECT * FROM api_keys"))).mappings().one()
+        assert saved["id"] == key.id and saved["key_hash"] == key.key_hash
+        assert saved["upstream_credential_id"] is None
+        assert (
+            await conn.scalar(
+                text("SELECT count(*) FROM schema_migrations WHERE version = 4")
+            )
+            == 1
+        )

@@ -538,3 +538,25 @@ def test_retry_after_http_date():
         <= cooldown_for_response(httpx.Response(429, headers={"retry-after": future}))
         <= 120
     )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_responses_uses_pool_and_fixed_binding(
+    client, accounts, key, pool_transport, stream
+):
+    await client.patch(
+        f"/admin/keys/{key.id}/upstream",
+        headers=ADMIN,
+        json={"upstream_credential_id": accounts[1]},
+    )
+    response = await client.post(
+        "/v1/responses",
+        headers=AUTH,
+        json={"model": "gpt-5.5", "input": "hello", "stream": stream},
+    )
+    assert response.status_code == 200
+    assert pool_transport["requests"] == ["account-1"]
+    if stream:
+        assert "event: response.completed" in response.text
+    else:
+        assert response.json()["output_text"] == "account-1"

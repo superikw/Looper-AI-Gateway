@@ -139,21 +139,30 @@ async def list_accounts(db, include_deleted: bool = False) -> list[dict]:
 
 
 async def update_account(db, cid: int, changes: dict) -> None:
-    async with (
-        database_lock("oauth-refresh", settings.upstream_timeout_seconds + 5),
-        database_lock(f"oauth-refresh-{cid}", settings.upstream_timeout_seconds + 5),
-    ):
-        await validate_binding(db, cid)
-        values = {
-            key: value for key, value in changes.items() if key in ("name", "enabled")
-        }
-        if changes.get("reset_cooldown"):
-            values["cooldown_until"] = None
-        if values:
-            values["updated_at"] = utcnow()
-            await db.execute(
-                update(UpstreamCredential)
-                .where(UpstreamCredential.id == cid)
-                .values(**values)
-            )
-            await db.commit()
+    try:
+        async with (
+            database_lock("oauth-refresh", settings.upstream_timeout_seconds + 5),
+            database_lock(
+                f"oauth-refresh-{cid}", settings.upstream_timeout_seconds + 5
+            ),
+        ):
+            await validate_binding(db, cid)
+            values = {
+                key: value
+                for key, value in changes.items()
+                if key in ("name", "enabled")
+            }
+            if changes.get("reset_cooldown"):
+                values["cooldown_until"] = None
+            if values:
+                values["updated_at"] = utcnow()
+                await db.execute(
+                    update(UpstreamCredential)
+                    .where(UpstreamCredential.id == cid)
+                    .values(**values)
+                )
+                await db.commit()
+    except TimeoutError:
+        raise HTTPException(
+            504, "timed out waiting to update upstream account"
+        ) from None

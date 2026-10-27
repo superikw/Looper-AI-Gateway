@@ -189,6 +189,8 @@ def extract_account_id(access_token: str, token_data: dict[str, Any]) -> str | N
 async def complete_oauth_session(
     db: AsyncSession, session_id: int, callback_url: str, name: str | None = None
 ) -> dict[str, Any]:
+    if name is not None and not 1 <= len(name) <= 128:
+        raise HTTPException(400, "account name must contain 1 to 128 characters")
     entity = await db.get(OAuthSession, session_id)
     if not entity:
         raise HTTPException(status_code=404, detail="oauth session not found")

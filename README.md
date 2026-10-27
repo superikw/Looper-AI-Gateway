@@ -2,9 +2,9 @@
 
 GitHub 仓库：https://github.com/superikw/Looper-AI-Gateway
 
-一个用 Python / FastAPI 实现的内部 AI 网关：管理员维护一份 ChatGPT / Codex 上游登录态，给下游用户分配独立 API Key，通过 OpenAI 风格接口转发请求并统计用量。
+一个用 Python / FastAPI 实现的内部 AI 网关：管理员维护多个 ChatGPT / Codex 上游账号，给下游用户分配独立 API Key，通过 OpenAI 风格接口转发请求并统计用量。
 
-下游 Key 隔离访问权限和用量，上游账号与额度共享。适合内部工具和少量可信用户；当前没有账号池、按 Key 配额、分布式调度或管理 UI。
+下游 Key 隔离访问权限和用量，默认使用上游账号池，也可固定绑定一个账号。适合内部工具和少量可信用户；当前没有按 Key 配额、跨主机调度或管理 UI。
 
 ## 功能与兼容范围
 
@@ -14,7 +14,7 @@ GitHub 仓库：https://github.com/superikw/Looper-AI-Gateway
 | `POST /v1/responses` | Responses 输入、工具定义、普通 JSON 和具名 SSE 事件 |
 | `GET /v1/models` | 返回本地模型白名单；不代表上游实时可用模型 |
 | `POST /v1/embeddings` | 明确返回 400，当前上游路线不支持 |
-| `/admin/*` | 用户、Key、OAuth 登录和用量管理 |
+| `/admin/*` | 用户、Key、上游账号池、OAuth 登录和用量管理 |
 | `GET /healthz` | 进程存活检查 |
 | `GET /readyz` | 数据库和上游凭证就绪检查；必要时刷新凭证，不发起模型推理 |
 
@@ -83,6 +83,9 @@ python -m app.main
 | `UPSTREAM_BASE_URL` | 默认 `https://chatgpt.com/backend-api` |
 | `UPSTREAM_AUTH_MODE` | `oauth_manual`、`codex_auth_file` 或 `env_token` |
 | `UPSTREAM_TIMEOUT_SECONDS` | 上游 HTTP 超时，默认 120 秒 |
+| `UPSTREAM_MAX_ATTEMPTS` | 账号池每个请求最多尝试的不同账号数，默认 3，范围 1–10；固定绑定只尝试一个 |
+| `UPSTREAM_FAILURE_COOLDOWN_SECONDS` | 连接或服务端错误后的冷却秒数，默认 10 |
+| `UPSTREAM_RATE_LIMIT_COOLDOWN_SECONDS` | 429 缺少有效 Retry-After 时的冷却秒数，默认 60 |
 | `MAX_REQUEST_BYTES` | 请求体大小限制，默认 16777216 字节（16 MiB） |
 | `DEFAULT_ALLOWED_MODELS` | 全局模型白名单，留空表示不限制；模型名会规范化 |
 | `DEFAULT_INSTRUCTIONS` | 缺少指令时使用的默认提示 |
@@ -90,7 +93,7 @@ python -m app.main
 
 模型白名单是访问策略，不能用来发现上游模型。项目没有自动选择“最新模型”的逻辑。
 
-推荐使用 `oauth_manual`。`codex_auth_file` 从 `CODEX_HOME/auth.json` 读取 access token，文件模式不会自行刷新登录态，需要外部维护；`env_token` 需要设置 `UPSTREAM_BEARER_TOKEN`。所有模式都需要可解析的 ChatGPT account ID，不能用任意官方 API Key 代替。
+多账号池仅在 `oauth_manual` 模式启用，推荐使用此模式。文件和环境变量模式仍使用单个账号。`codex_auth_file` 从 `CODEX_HOME/auth.json` 读取 access token，文件模式不会自行刷新登录态，需要外部维护；`env_token` 需要设置 `UPSTREAM_BEARER_TOKEN`。所有模式都需要可解析的 ChatGPT account ID，不能用任意官方 API Key 代替。
 
 Docker 镜像未安装 Codex CLI；如使用文件模式，需要挂载认证文件。如使用 CLI 登录管理接口，还需自行准备含 Codex CLI 的运行环境。
 
@@ -105,6 +108,7 @@ docker compose exec looper-ai-gateway python manage.py auth-start
 ```bash
 docker compose exec looper-ai-gateway python manage.py auth-complete \
   --session-id 1 \
+  --name 'work-account' \
   --callback-url 'http://localhost:1455/auth/callback?code=...&state=...'
 docker compose exec looper-ai-gateway python manage.py auth-status
 curl http://127.0.0.1:34567/readyz
@@ -112,15 +116,58 @@ curl http://127.0.0.1:34567/readyz
 
 这是手动回调流程，不需要 Gateway 监听 1455 端口。授权会话会校验 state 和过期时间，完成后清除 verifier，并仅保存回调已接收的标记。
 
-OAuth 凭证在到期前 90 秒触发刷新。同一台主机、共享数据库和相同密钥目录的进程会协调刷新，避免重复使用轮换中的 refresh token。锁和 SQLite 不用于跨主机部署。
+为每个账号重复以上登录流程，可用不同浏览器配置或退出浏览器登录后切换账号。不同 ChatGPT account ID 分别保存；同一未删除账号重新登录会更新其凭证并重新启用，不覆盖其他账号。`--name` 是可选备注。
 
-退出数据库中的 OAuth 登录态：
+OAuth 凭证在到期前 90 秒触发刷新。同一账号的刷新使用进程间锁，避免重复使用轮换中的 refresh token；不同账号可以并行刷新。同一台主机的进程需共享数据库和相同密钥目录。锁和 SQLite 不用于跨主机部署。
+
+退出数据库中所有 OAuth 账号（指定 `--credential-id` 可只退出一个）：
 
 ```bash
 docker compose exec looper-ai-gateway python manage.py logout
 ```
 
-CLI 和 HTTP logout 都采用软删除，保留加密凭证与删除时间；状态查询、请求转发和刷新都会排除已删除凭证。重新登录会创建新凭证，不恢复历史记录。logout 与凭证刷新、登录保存共用进程间锁，避免并发刷新恢复已退出的凭证。此操作针对数据库 OAuth 凭证；文件和环境变量模式的认证需在各自来源管理。
+CLI 和 HTTP logout 都采用软删除，保留加密凭证与删除时间；默认状态查询、请求转发和刷新都会排除已删除凭证。已删除账号重新登录会创建新记录，绑定旧记录的 Key 需要重新绑定。logout 与登录保存协调锁，并等待相关账号的刷新锁，避免并发刷新恢复已退出的凭证。此操作针对数据库 OAuth 凭证；文件和环境变量模式的认证需在各自来源管理。
+
+## 多账号池与固定绑定
+
+以下命令可在容器内执行；本地运行时直接使用 `python manage.py`。
+
+```bash
+python manage.py list-upstreams
+python manage.py update-upstream 1 --name 'team-a' --disable
+python manage.py update-upstream 1 --enable --reset-cooldown
+python manage.py logout --credential-id 1
+python manage.py list-upstreams --include-deleted
+```
+
+未绑定的 Key 按最近使用时间轮换启用、未删除且不在冷却中的账号。选择记录保存在数据库中，同一主机多个 worker 共享调度顺序，重启后也会保留。暂停、删除或冷却中的账号不会接收新的调度；已经发出的请求会继续处理。
+
+收到明确的 HTTP 401、403、429、500、502、503、504，或建立连接失败时，未绑定请求会在尝试次数内改用其他账号，每个账号最多尝试一次。401/403 冷却 300 秒；429 优先遵循 Retry-After（秒数或 HTTP 日期，限制为 1 秒至 1 天），其他错误使用配置的冷却时间。并发错误不会缩短已有冷却；管理员可手动清除。`/readyz` 至少需要一个可用账号，全部冷却时返回 503。
+
+收到 HTTP 成功响应后，正文错误或流中断不会切号；读写超时也不会自动重放。流式输出始终来自同一个账号。服务端 5xx 重试无法保证上游完全没有处理过前一次请求。账号池不读取上游剩余额度，也不保证不同账号支持完全相同的模型。
+
+固定绑定示例：
+
+```bash
+python manage.py create-key --user-id 1 --name dedicated --upstream-id 2
+python manage.py bind-key 1 --upstream-id 2
+python manage.py bind-key 1 --auto
+```
+
+固定绑定的账号不可用时，该 Key 返回 503，不会使用其他账号；首次收到的上游 HTTP 错误仍保留其状态码。绑定为 `null`（CLI 的 `--auto`）表示恢复账号池调度。旧 Key 自动使用账号池，无需重新创建。
+
+管理员 HTTP 接口也支持上述操作：
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /admin/auth/codex/oauth/complete` | 保存账号，支持可选 `name` |
+| `GET /admin/upstreams` | 账号状态、冷却时间与用量；`include_deleted=true` 包含历史记录，不返回凭证 |
+| `PATCH /admin/upstreams/{id}` | 修改 `name`、`enabled` 或设置 `reset_cooldown=true` |
+| `DELETE /admin/upstreams/{id}` | 退出指定账号，保留历史记录 |
+| `POST /admin/keys` | 创建 Key，可选 `upstream_credential_id` |
+| `PATCH /admin/keys/{id}/upstream` | 设置 `upstream_credential_id`，传 `null` 取消绑定 |
+
+原有 `auth-status` 和单账号状态接口仍显示最近添加且启用、未退出的账号，查看完整池请使用 `list-upstreams` 或 `/admin/upstreams`。
 
 ## 用户、Key 与用量
 
@@ -138,6 +185,8 @@ docker compose exec looper-ai-gateway python manage.py usage
 Key 明文仅在创建时返回，数据库保存 SHA-256 摘要。删除采用软删除：撤销访问、从 Key 列表隐藏并禁止重新启用，保留历史用量。用量汇总包含已删除 Key，计数使用数据库原子累加。
 
 通过鉴权后的请求，包括参数错误和上游错误，都会计入请求次数。流式取消记录为 499；上游未返回的 token 用量无法精确补算。统计用于使用情况追踪，不是账单结算系统。
+
+账号的 `request_count` 表示被调度次数，包含重试和刷新失败；`failure_count` 表示触发冷却的失败次数。下游一次请求只计一次，日志关联最终使用或报错的账号，token 计入该账号。此前失败尝试未返回的用量无法补算。升级前的历史日志保留原数据，不会猜测账号归属；账号维度的统计从升级后开始累计。
 
 管理员 HTTP 接口使用 `Authorization: Bearer <ADMIN_TOKEN>`。接口清单可在 `/docs` 查看；`manage.py` 直接访问数据库，不需要通过 HTTP 管理员鉴权。
 
@@ -165,7 +214,7 @@ curl -N http://127.0.0.1:34567/v1/chat/completions \
 
 ## 升级、存储与日志
 
-启动服务和执行数据库管理命令时，会自动执行幂等迁移并记录 schema 版本：添加软删除字段，把旧版上游凭证和 OAuth verifier 转为加密值。升级前先备份数据库。
+启动服务和执行数据库管理命令时，会自动执行幂等迁移并记录 schema 版本：添加软删除、账号池、Key 绑定及用量归属字段，把旧版上游凭证和 OAuth verifier 转为加密值。现有账号保留并默认启用，新增账号计数初始化为零。升级前先备份数据库。
 
 迁移每批处理 256 条记录，在 Python 中加密后通过 `executemany` 批量写入。未变化的密文和已清理的回调不会重复改写；密钥校验失败会回滚迁移。
 
@@ -190,4 +239,4 @@ ruff check app manage.py tests
 ruff format --check app manage.py tests
 ```
 
-测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新、工具与图片转换、SSE 拆包、流式取消和就绪检查。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查。
+测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新与账号轮换、故障冷却、Key 绑定、账号用量归属、工具与图片转换、SSE 拆包、流式取消和就绪检查。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查。

@@ -8,6 +8,7 @@ import secrets
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from app.config import settings
@@ -21,6 +22,7 @@ from app.oauth_manual import (
     logout_upstream_credentials,
     start_oauth_session,
 )
+from app.upstreams import list_accounts, update_account, validate_binding
 from app.utils import make_api_key, mask_key, sha256_text, utcnow
 
 
@@ -89,7 +91,9 @@ async def cmd_auth_start(_: argparse.Namespace) -> None:
 async def cmd_auth_complete(args: argparse.Namespace) -> None:
     await ensure_db()
     async with AsyncSessionLocal() as db:
-        result = await complete_oauth_session(db, args.session_id, args.callback_url)
+        result = await complete_oauth_session(
+            db, args.session_id, args.callback_url, getattr(args, "name", None)
+        )
     print_json(result)
 
 
@@ -149,11 +153,47 @@ async def cmd_auth_status(args: argparse.Namespace) -> None:
         )
 
 
-async def cmd_logout(_: argparse.Namespace) -> None:
+async def cmd_logout(args: argparse.Namespace) -> None:
     await ensure_db()
     async with AsyncSessionLocal() as db:
-        count = await logout_upstream_credentials(db)
+        count = await logout_upstream_credentials(
+            db, getattr(args, "credential_id", None)
+        )
     print_json({"ok": True, "deleted_credentials": count})
+
+
+async def cmd_list_upstreams(args: argparse.Namespace) -> None:
+    await ensure_db()
+    async with AsyncSessionLocal() as db:
+        print_json(await list_accounts(db, args.include_deleted))
+
+
+async def cmd_update_upstream(args: argparse.Namespace) -> None:
+    await ensure_db()
+    changes = {"reset_cooldown": args.reset_cooldown}
+    if args.name is not None:
+        if not 1 <= len(args.name) <= 128:
+            raise SystemExit("account name must contain 1 to 128 characters")
+        changes["name"] = args.name
+    if args.enabled is not None:
+        changes["enabled"] = args.enabled
+    async with AsyncSessionLocal() as db:
+        await update_account(db, args.credential_id, changes)
+    print_json({"ok": True, "id": args.credential_id})
+
+
+async def cmd_bind_key(args: argparse.Namespace) -> None:
+    await ensure_db()
+    async with AsyncSessionLocal() as db:
+        entity = await db.get(ApiKey, args.key_id)
+        if not entity or entity.deleted_at is not None:
+            raise SystemExit(f"key not found: {args.key_id}")
+        await validate_binding(db, args.upstream_id)
+        entity.upstream_credential_id = args.upstream_id
+        await db.commit()
+    print_json(
+        {"ok": True, "id": args.key_id, "upstream_credential_id": args.upstream_id}
+    )
 
 
 async def cmd_create_user(args: argparse.Namespace) -> None:
@@ -197,12 +237,15 @@ async def cmd_create_key(args: argparse.Namespace) -> None:
         if not user:
             raise SystemExit(f"user not found: {args.user_id}")
         raw_key = make_api_key()
+        upstream_id = getattr(args, "upstream_id", None)
+        await validate_binding(db, upstream_id)
         entity = ApiKey(
             user_id=args.user_id,
             name=args.name,
             key_hash=sha256_text(raw_key),
             key_preview=mask_key(raw_key) or "***",
             enabled=True,
+            upstream_credential_id=upstream_id,
         )
         db.add(entity)
         await db.commit()
@@ -215,6 +258,7 @@ async def cmd_create_key(args: argparse.Namespace) -> None:
             "api_key": raw_key,
             "key_preview": entity.key_preview,
             "enabled": entity.enabled,
+            "upstream_credential_id": entity.upstream_credential_id,
             "created_at": entity.created_at,
         }
     )
@@ -243,6 +287,7 @@ async def cmd_list_keys(_: argparse.Namespace) -> None:
                 "name": k.name,
                 "key_preview": k.key_preview,
                 "enabled": k.enabled,
+                "upstream_credential_id": k.upstream_credential_id,
                 "request_count": k.request_count,
                 "prompt_tokens": k.prompt_tokens,
                 "completion_tokens": k.completion_tokens,
@@ -336,6 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("auth-complete", help="Complete OAuth login with callback URL")
     p.add_argument("--session-id", type=int, required=True)
     p.add_argument("--callback-url", required=True)
+    p.add_argument("--name", help="Optional account name")
     p.set_defaults(func=cmd_auth_complete)
 
     p = sub.add_parser(
@@ -344,9 +390,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-id", type=int)
     p.set_defaults(func=cmd_auth_status)
 
-    sub.add_parser(
-        "logout", help="Soft-delete stored upstream credentials"
-    ).set_defaults(func=cmd_logout)
+    p = sub.add_parser("logout", help="Soft-delete one or all stored upstream accounts")
+    p.add_argument("--credential-id", type=int, help="Omit to log out all accounts")
+    p.set_defaults(func=cmd_logout)
+
+    p = sub.add_parser("list-upstreams", help="List upstream accounts and usage")
+    p.add_argument("--include-deleted", action="store_true")
+    p.set_defaults(func=cmd_list_upstreams)
+
+    p = sub.add_parser("update-upstream", help="Rename, pause or resume an account")
+    p.add_argument("credential_id", type=int)
+    p.add_argument("--name")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--enable", dest="enabled", action="store_const", const=True)
+    group.add_argument("--disable", dest="enabled", action="store_const", const=False)
+    p.add_argument("--reset-cooldown", action="store_true")
+    p.set_defaults(func=cmd_update_upstream, enabled=None)
 
     p = sub.add_parser("create-user", help="Create a new user")
     p.add_argument("name")
@@ -358,9 +417,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create-key", help="Create a new API key for a user")
     p.add_argument("--user-id", type=int, required=True)
     p.add_argument("--name", required=True)
+    p.add_argument(
+        "--upstream-id", type=int, help="Bind to one account; omit for the pool"
+    )
     p.set_defaults(func=cmd_create_key)
 
     sub.add_parser("list-keys", help="List API keys").set_defaults(func=cmd_list_keys)
+
+    p = sub.add_parser(
+        "bind-key", help="Bind a key to one account or return to the pool"
+    )
+    p.add_argument("key_id", type=int)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--upstream-id", type=int)
+    group.add_argument("--auto", dest="upstream_id", action="store_const", const=None)
+    p.set_defaults(func=cmd_bind_key)
 
     p = sub.add_parser("disable-key", help="Disable an API key")
     p.add_argument("key_id", type=int)
@@ -383,6 +454,8 @@ async def amain() -> None:
     args = parser.parse_args()
     try:
         await args.func(args)
+    except HTTPException as exc:
+        raise SystemExit(f"{exc.status_code}: {exc.detail}") from None
     finally:
         await close_http_client()
         await engine.dispose()

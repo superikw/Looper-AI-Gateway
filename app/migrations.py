@@ -117,6 +117,11 @@ async def initialize_database() -> None:
                         f"ALTER TABLE {table} ADD COLUMN upstream_credential_id INTEGER REFERENCES upstream_credentials(id)"
                     )
                 )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_usage_logs_upstream_credential_id ON usage_logs (upstream_credential_id)"
+            )
+        )
         if not (
             await conn.execute(
                 text("SELECT version FROM schema_migrations WHERE version = 4")

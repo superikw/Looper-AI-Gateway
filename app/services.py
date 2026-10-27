@@ -160,7 +160,10 @@ async def open_upstream(
         1 if upstream_credential_id is not None else settings.upstream_max_attempts
     )
     for attempt in range(attempts):
-        cid = await claim_account(upstream_credential_id, excluded)
+        try:
+            cid = await claim_account(upstream_credential_id, excluded)
+        except TimeoutError:
+            raise HTTPException(503, "upstream account scheduler is busy") from None
         if cid is None:
             break
         excluded.add(cid)
