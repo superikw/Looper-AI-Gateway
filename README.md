@@ -622,6 +622,39 @@ docker compose exec warp sh /usr/local/bin/warp-healthcheck.sh
 
 Gateway 只依赖 WARP 容器先创建，不会在 Compose 层无限等待健康条件。WARP 运行中变为 unhealthy 不会自动停止或重启 Gateway，需结合日志与实际代理请求判断。
 
+如果 `podman-compose up -d` 长时间没有返回，先按 `Ctrl-C`，再直接查看容器健康状态和最近一次检查结果。Podman 的健康检查可以单独执行，退出码 `0` 表示成功，`1` 表示检查失败：
+
+```bash
+WARP_CONTAINER=looper-ai-gateway_warp_1
+podman ps -a --filter "name=$WARP_CONTAINER"
+podman inspect --format '{{.State.Status}} health={{.State.Health.Status}}' "$WARP_CONTAINER"
+podman inspect "$WARP_CONTAINER" | jq '.[0].State.Health'
+podman healthcheck run "$WARP_CONTAINER"; echo "healthcheck_exit=$?"
+podman exec "$WARP_CONTAINER" sh -x /usr/local/bin/warp-healthcheck.sh
+podman logs --tail=200 "$WARP_CONTAINER"
+```
+
+根据最后一条命令的输出处理：
+
+| 现象 | 处理 |
+| --- | --- |
+| `Could not resolve host` | 检查服务器 DNS、Podman 网络和出站 DNS |
+| `Connection refused` 或 1080 无监听 | 查看 WARP 日志，等待首次注册；必要时提高 `.env` 的 `WARP_SLEEP` 后 `podman-compose up -d --force-recreate` |
+| `Operation not permitted`、TUN 错误 | 确认 `/dev/net/tun` 存在，并允许 `NET_ADMIN`、`MKNOD`、`AUDIT_WRITE`；受限 VPS/LXC 需要服务商开放 TUN |
+| trace 能访问但 `warp=off` | WARP 没有建立隧道，检查日志和服务器出站 TCP/UDP 443 |
+| `warp=on` 或 `warp=plus` | WARP 健康，继续检查 Gateway 日志和 `/readyz` |
+
+若这是全新服务器且 `warp-data/` 中没有需要保留的注册状态，可以重置 WARP 数据后重建；已有服务器不要删除该目录：
+
+```bash
+podman-compose down
+mv warp-data "warp-data.backup.$(date +%Y%m%d-%H%M%S)"
+mkdir -p warp-data
+podman-compose up -d --force-recreate
+```
+
+Podman 官方文档也建议使用 `podman inspect` 查看 `.State.Health`，并用 `podman healthcheck run` 手动触发检查。[健康检查文档](https://docs.podman.io/en/stable/markdown/podman-healthcheck.1.html)
+
 ### 健康检查正常，但无法调用模型
 
 | 检查 | 验证范围 |
