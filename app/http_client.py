@@ -1,9 +1,31 @@
 import httpx
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import settings
 
 _client: httpx.AsyncClient | None = None
+
+
+class ProxyTransportError(HTTPException):
+    """A failure on the shared proxy route, not evidence of an account fault."""
+
+    def __init__(self, timeout: bool = False):
+        super().__init__(
+            504 if timeout else 503,
+            "upstream proxy request timed out"
+            if timeout
+            else "upstream proxy transport is unavailable",
+            headers={"Retry-After": str(settings.upstream_failure_cooldown_seconds)},
+        )
+
+
+def proxy_transport_error(exc: httpx.RequestError) -> ProxyTransportError | None:
+    # A proxy connection error is explicit. For the configured shared route,
+    # other transport failures cannot reliably be attributed to an account.
+    if settings.upstream_proxy_url or isinstance(exc, httpx.ProxyError):
+        return ProxyTransportError(isinstance(exc, httpx.TimeoutException))
+    return None
 
 
 class TokenResponse(BaseModel):
@@ -20,6 +42,7 @@ def get_http_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
+            proxy=settings.upstream_proxy_url or None,
             timeout=settings.upstream_timeout_seconds,
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
@@ -34,13 +57,14 @@ async def close_http_client() -> None:
 
 
 async def post_oauth(data: dict) -> dict:
-    from fastapi import HTTPException
-
     try:
         response = await get_http_client().post(settings.oauth_token_url, data=data)
-    except httpx.TimeoutException:
-        raise HTTPException(504, "OAuth endpoint timed out") from None
-    except httpx.RequestError:
+    except httpx.RequestError as exc:
+        error = proxy_transport_error(exc)
+        if error is not None:
+            raise error from None
+        if isinstance(exc, httpx.TimeoutException):
+            raise HTTPException(504, "OAuth endpoint timed out") from None
         raise HTTPException(502, "OAuth endpoint is unavailable") from None
     if response.status_code >= 400:
         raise HTTPException(

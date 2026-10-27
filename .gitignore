@@ -5,6 +5,7 @@ __pycache__/
 !.env.example
 !.env.docker.example
 data/
+warp-data/
 .venv/
 .pytest_cache/
 .ruff_cache/

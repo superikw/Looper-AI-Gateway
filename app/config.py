@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.model_utils import normalize_model_list
@@ -37,6 +38,7 @@ class Settings(BaseSettings):
     upstream_timeout_seconds: int = Field(
         default=120, alias="UPSTREAM_TIMEOUT_SECONDS", gt=0
     )
+    upstream_proxy_url: str = Field(default="", alias="UPSTREAM_PROXY_URL")
     upstream_max_attempts: int = Field(
         default=3, alias="UPSTREAM_MAX_ATTEMPTS", ge=1, le=10
     )
@@ -103,6 +105,26 @@ class Settings(BaseSettings):
     codex_login_log_file: str = Field(
         default="./data/codex-login.log", alias="CODEX_LOGIN_LOG_FILE"
     )
+
+    @field_validator("upstream_proxy_url")
+    @classmethod
+    def validate_proxy_url(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        # HTTP CONNECT proxies also support HTTPS destinations; SOCKS would
+        # require an additional optional dependency that this image omits.
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("UPSTREAM_PROXY_URL must be an HTTP(S) proxy URL")
+        _ = parsed.port  # Validate malformed or out-of-range port numbers.
+        return value
 
     def validate_runtime(self) -> None:
         if not self.admin_token_is_secure:

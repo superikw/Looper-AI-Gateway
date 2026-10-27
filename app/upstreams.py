@@ -14,6 +14,7 @@ from sqlalchemy import case, delete, or_, select, update
 
 from app.config import settings
 from app.db import AsyncSessionLocal
+from app.http_client import ProxyTransportError
 from app.locks import database_lock, lock_path, try_process_lock
 from app.models import UpstreamCredential, UpstreamRequest
 from app.oauth_manual import get_active_upstream_credential
@@ -324,6 +325,8 @@ async def pool_is_ready(db) -> bool:
                 or extract_account_id_from_token(credential.access_token)
             ):
                 return True
+        except ProxyTransportError:
+            return False
         except HTTPException:
             continue
     return False

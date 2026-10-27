@@ -11,6 +11,7 @@ from starlette.background import BackgroundTask
 
 from app.config import settings
 from app.db import AsyncSessionLocal
+from app.http_client import ProxyTransportError
 from app.protocol import (
     ResponseAccumulator,
     normalize_codex_response_to_chat,
@@ -231,7 +232,9 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
             await close_upstream(response)
             if isinstance(exc, HTTPException):
                 exc.upstream_credential_id = cid
-                if response.status_code < 400:
+                if response.status_code < 400 and not isinstance(
+                    exc, ProxyTransportError
+                ):
                     await mark_account_failure(
                         cid, settings.upstream_failure_cooldown_seconds
                     )
@@ -246,6 +249,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
         "code": 499,
         "data": {"error": {"message": "client disconnected"}},
         "recorded": False,
+        "account_failure": False,
     }
 
     async def cleanup():
@@ -256,7 +260,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
         # A fresh session and a cancellation shield preserve the final audit row.
         with anyio.CancelScope(shield=True):
             await close_upstream(response)
-            if state["code"] >= 400 and state["code"] != 499:
+            if state["account_failure"]:
                 await mark_account_failure(
                     cid, settings.upstream_failure_cooldown_seconds
                 )
@@ -293,7 +297,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                     break
             data = accumulator.result()
             code, result = format_upstream_result(path, payload, 200, data)
-            state.update(code=code, data=result)
+            state.update(code=code, data=result, account_failure=code >= 400)
             if code >= 400:
                 yield sse(result, "error" if path == "/v1/responses" else None)
             elif path == "/v1/chat/completions":
@@ -303,7 +307,11 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                 yield "data: [DONE]\n\n"
         except HTTPException as exc:
             error = {"error": {"message": str(exc.detail), "type": "upstream_error"}}
-            state.update(code=exc.status_code, data=error)
+            state.update(
+                code=exc.status_code,
+                data=error,
+                account_failure=not isinstance(exc, ProxyTransportError),
+            )
             yield sse(error, "error" if path == "/v1/responses" else None)
             if path == "/v1/chat/completions":
                 yield "data: [DONE]\n\n"

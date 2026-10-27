@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.codex_auth import CodexAuthError, codex_auth_manager
 from app.config import settings
 from app.db import AsyncSessionLocal
-from app.http_client import get_http_client
+from app.http_client import ProxyTransportError, get_http_client, proxy_transport_error
 from app.model_utils import canonicalize_model_name
 from app.models import ApiKey, UpstreamCredential, UsageLog
 from app.oauth_manual import get_active_upstream_credential
@@ -78,6 +78,9 @@ async def resolve_upstream_bearer_token(db: AsyncSession | None = None) -> str:
 
 
 def network_error(exc: httpx.RequestError) -> HTTPException:
+    error = proxy_transport_error(exc)
+    if error is not None:
+        return error
     if isinstance(exc, httpx.TimeoutException):
         return HTTPException(504, "upstream request timed out")
     return HTTPException(502, "upstream connection failed")
@@ -224,6 +227,9 @@ async def open_upstream(
                             502,
                             "upstream credential does not contain a ChatGPT account ID",
                         )
+            except ProxyTransportError as exc:
+                exc.upstream_credential_id = cid
+                raise
             except HTTPException as exc:
                 exc.upstream_credential_id = cid
                 last_error = exc
@@ -245,6 +251,8 @@ async def open_upstream(
             except httpx.RequestError as exc:
                 error = network_error(exc)
                 error.upstream_credential_id = cid
+                if isinstance(error, ProxyTransportError):
+                    raise error from None
                 await mark_account_failure(
                     cid, settings.upstream_failure_cooldown_seconds
                 )
@@ -376,7 +384,7 @@ async def forward_to_upstream(
         return code, result, request_id(response), cid
     except HTTPException as exc:
         exc.upstream_credential_id = cid
-        if response.status_code < 400:
+        if response.status_code < 400 and not isinstance(exc, ProxyTransportError):
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
         raise
     finally:
