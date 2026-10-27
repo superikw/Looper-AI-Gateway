@@ -29,7 +29,15 @@ from app.oauth_manual import (
 )
 from app.oauth_schemas import OAuthCompleteRequest
 from app.proxy_schemas import validate_proxy_payload
-from app.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyOut, UserCreate, UserOut
+from app.schemas import (
+    ApiKeyBinding,
+    ApiKeyCreate,
+    ApiKeyCreated,
+    ApiKeyOut,
+    UpstreamAccountUpdate,
+    UserCreate,
+    UserOut,
+)
 from app.services import (
     forward_to_upstream,
     parse_request_json,
@@ -40,6 +48,7 @@ from app.services import (
 )
 from app.streaming import stream_to_upstream
 from app.token_utils import extract_account_id_from_token
+from app.upstreams import list_accounts, pool_is_ready, update_account, validate_binding
 from app.utils import make_api_key, mask_key, sha256_text, utcnow
 
 
@@ -87,8 +96,13 @@ async def readyz(db: AsyncSession = Depends(get_db)):
     try:
         await db.execute(text("SELECT 1"))
         checks["database"] = True
-        token, account = await resolve_upstream_credential(db)
-        checks["upstream_auth"] = bool(account or extract_account_id_from_token(token))
+        if settings.upstream_auth_mode == "oauth_manual":
+            checks["upstream_auth"] = await pool_is_ready(db)
+        else:
+            token, account = await resolve_upstream_credential(db)
+            checks["upstream_auth"] = bool(
+                account or extract_account_id_from_token(token)
+            )
     except (HTTPException, SQLAlchemyError, ValueError, OSError):
         pass
     ready = all(checks.values())
@@ -124,6 +138,7 @@ async def create_key(payload: ApiKeyCreate, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, payload.user_id)
     if not user:
         raise HTTPException(status_code=404, detail="user not found")
+    await validate_binding(db, payload.upstream_credential_id)
 
     raw_key = make_api_key()
     entity = ApiKey(
@@ -132,6 +147,7 @@ async def create_key(payload: ApiKeyCreate, db: AsyncSession = Depends(get_db)):
         key_hash=sha256_text(raw_key),
         key_preview=mask_key(raw_key) or "***",
         enabled=True,
+        upstream_credential_id=payload.upstream_credential_id,
     )
     db.add(entity)
     await db.commit()
@@ -144,6 +160,7 @@ async def create_key(payload: ApiKeyCreate, db: AsyncSession = Depends(get_db)):
         key_preview=entity.key_preview,
         enabled=entity.enabled,
         created_at=entity.created_at,
+        upstream_credential_id=entity.upstream_credential_id,
     )
 
 
@@ -155,6 +172,50 @@ async def list_keys(db: AsyncSession = Depends(get_db)):
         select(ApiKey).where(ApiKey.deleted_at.is_(None)).order_by(ApiKey.id.asc())
     )
     return list(result.scalars().all())
+
+
+@app.patch("/admin/keys/{key_id}/upstream", dependencies=[Depends(require_admin)])
+async def bind_key(
+    key_id: int, payload: ApiKeyBinding, db: AsyncSession = Depends(get_db)
+):
+    key = await db.get(ApiKey, key_id)
+    if not key or key.deleted_at is not None:
+        raise HTTPException(404, "key not found")
+    await validate_binding(db, payload.upstream_credential_id)
+    key.upstream_credential_id = payload.upstream_credential_id
+    await db.commit()
+    return {
+        "ok": True,
+        "id": key_id,
+        "upstream_credential_id": key.upstream_credential_id,
+    }
+
+
+@app.get("/admin/upstreams", dependencies=[Depends(require_admin)])
+async def upstream_accounts(
+    include_deleted: bool = False, db: AsyncSession = Depends(get_db)
+):
+    return await list_accounts(db, include_deleted)
+
+
+@app.patch("/admin/upstreams/{credential_id}", dependencies=[Depends(require_admin)])
+async def patch_upstream(
+    credential_id: int,
+    payload: UpstreamAccountUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("enabled", True) is None:
+        raise HTTPException(400, "enabled must be a boolean")
+    await update_account(db, credential_id, changes)
+    return {"ok": True, "id": credential_id}
+
+
+@app.delete("/admin/upstreams/{credential_id}", dependencies=[Depends(require_admin)])
+async def delete_upstream(credential_id: int, db: AsyncSession = Depends(get_db)):
+    if not await logout_upstream_credentials(db, credential_id):
+        raise HTTPException(404, "upstream account not found")
+    return {"ok": True, "deleted": credential_id}
 
 
 @app.delete("/admin/keys/{key_id}", dependencies=[Depends(require_admin)])
@@ -301,7 +362,9 @@ async def admin_oauth_start(db: AsyncSession = Depends(get_db)):
 async def admin_oauth_complete(
     payload: OAuthCompleteRequest, db: AsyncSession = Depends(get_db)
 ):
-    return await complete_oauth_session(db, payload.session_id, payload.callback_url)
+    return await complete_oauth_session(
+        db, payload.session_id, payload.callback_url, payload.name
+    )
 
 
 @app.get(

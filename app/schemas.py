@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
 class UserCreate(BaseModel):
@@ -22,6 +22,7 @@ class UserOut(BaseModel):
 class ApiKeyCreate(BaseModel):
     user_id: int = Field(gt=0)
     name: str = Field(min_length=1, max_length=128)
+    upstream_credential_id: int | None = Field(default=None, gt=0)
 
 
 class ApiKeyCreated(BaseModel):
@@ -32,6 +33,7 @@ class ApiKeyCreated(BaseModel):
     key_preview: str
     enabled: bool
     created_at: datetime
+    upstream_credential_id: int | None = None
 
 
 class ApiKeyOut(BaseModel):
@@ -45,5 +47,18 @@ class ApiKeyOut(BaseModel):
     completion_tokens: int
     total_tokens: int
     created_at: datetime
+    upstream_credential_id: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ApiKeyBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    upstream_credential_id: int | None = Field(gt=0)
+
+
+class UpstreamAccountUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    enabled: StrictBool | None = None
+    reset_cooldown: StrictBool = False

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import secrets
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -27,29 +28,53 @@ def active_upstream_credential_query():
         .where(
             UpstreamCredential.provider == "codex",
             UpstreamCredential.deleted_at.is_(None),
+            UpstreamCredential.enabled.is_(True),
         )
         .order_by(UpstreamCredential.id.desc())
         .limit(1)
     )
 
 
-async def logout_upstream_credentials(db: AsyncSession) -> int:
+async def logout_upstream_credentials(
+    db: AsyncSession, credential_id: int | None = None
+) -> int:
     try:
         async with database_lock(
             "oauth-refresh", settings.upstream_timeout_seconds + 5
         ):
-            now = _now()
-            result = await db.execute(
-                update(UpstreamCredential)
+            query = (
+                select(UpstreamCredential.id)
                 .where(
                     UpstreamCredential.provider == "codex",
                     UpstreamCredential.deleted_at.is_(None),
                 )
-                .values(deleted_at=now, updated_at=now)
-                .execution_options(synchronize_session=False)
+                .order_by(UpstreamCredential.id)
             )
-            await db.commit()
-            return result.rowcount
+            if credential_id is not None:
+                query = query.where(UpstreamCredential.id == credential_id)
+            ids = list((await db.scalars(query)).all())
+            if not ids:
+                return 0
+            async with AsyncExitStack() as stack:
+                for cid in ids:
+                    await stack.enter_async_context(
+                        database_lock(
+                            f"oauth-refresh-{cid}",
+                            settings.upstream_timeout_seconds + 5,
+                        )
+                    )
+                now = _now()
+                result = await db.execute(
+                    update(UpstreamCredential)
+                    .where(
+                        UpstreamCredential.id.in_(ids),
+                        UpstreamCredential.deleted_at.is_(None),
+                    )
+                    .values(deleted_at=now, updated_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+                await db.commit()
+                return result.rowcount
     except TimeoutError:
         raise HTTPException(
             504, "Timed out waiting to log out upstream credentials"
@@ -162,7 +187,7 @@ def extract_account_id(access_token: str, token_data: dict[str, Any]) -> str | N
 
 
 async def complete_oauth_session(
-    db: AsyncSession, session_id: int, callback_url: str
+    db: AsyncSession, session_id: int, callback_url: str, name: str | None = None
 ) -> dict[str, Any]:
     entity = await db.get(OAuthSession, session_id)
     if not entity:
@@ -203,29 +228,54 @@ async def complete_oauth_session(
             await db.refresh(entity)
             if entity.status != "pending":
                 raise HTTPException(409, f"oauth session already {entity.status}")
-            existing = await db.execute(active_upstream_credential_query())
-            current = existing.scalars().first()
+            # Match the actual ChatGPT account; a different login adds a pool
+            # member instead of overwriting the previous account's credential.
+            existing = (
+                await db.execute(
+                    select(UpstreamCredential)
+                    .where(
+                        UpstreamCredential.provider == "codex",
+                        UpstreamCredential.deleted_at.is_(None),
+                        UpstreamCredential.account_id == account_id,
+                    )
+                    .order_by(UpstreamCredential.id.desc())
+                    .limit(1)
+                )
+                if account_id
+                else None
+            )
+            current = existing.scalars().first() if existing is not None else None
             if not current:
                 current = UpstreamCredential(provider="codex")
                 db.add(current)
-
-            current.auth_mode = "oauth_manual"
-            current.access_token = access_token
-            current.refresh_token = refresh_token
-            current.token_type = token_data.get("token_type", "Bearer")
-            current.scope = token_data.get("scope")
-            current.expires_at = expires_at
-            current.account_id = account_id
-            current.raw_json = json.dumps(token_data, ensure_ascii=False)
-            current.updated_at = _now()
-
-            entity.status = "completed"
-            entity.callback_url = "received"
-            entity.code_verifier = ""
-            entity.completed_at = _now()
-
-            await db.commit()
-            await db.refresh(current)
+            async with AsyncExitStack() as stack:
+                if current.id is not None:
+                    await stack.enter_async_context(
+                        database_lock(
+                            f"oauth-refresh-{current.id}",
+                            settings.upstream_timeout_seconds + 5,
+                        )
+                    )
+                    await db.refresh(current)
+                current.auth_mode = "oauth_manual"
+                current.access_token = access_token
+                current.refresh_token = refresh_token
+                current.token_type = token_data.get("token_type", "Bearer")
+                current.scope = token_data.get("scope")
+                current.expires_at = expires_at
+                current.account_id = account_id
+                current.enabled = True
+                current.cooldown_until = None
+                if name is not None:
+                    current.name = name
+                current.raw_json = json.dumps(token_data, ensure_ascii=False)
+                current.updated_at = _now()
+                entity.status = "completed"
+                entity.callback_url = "received"
+                entity.code_verifier = ""
+                entity.completed_at = _now()
+                await db.commit()
+                await db.refresh(current)
     except TimeoutError:
         raise HTTPException(
             504, "Timed out waiting to store upstream credentials"
@@ -259,7 +309,7 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> dict[str, An
 async def refresh_upstream_credential(
     db: AsyncSession, credential: UpstreamCredential
 ) -> UpstreamCredential:
-    if credential.deleted_at is not None:
+    if credential.deleted_at is not None or not credential.enabled:
         raise HTTPException(
             401, "upstream credential has been logged out; please login again"
         )
@@ -295,8 +345,13 @@ async def refresh_upstream_credential(
     return credential
 
 
-async def get_active_upstream_credential(db: AsyncSession) -> UpstreamCredential | None:
-    result = await db.execute(active_upstream_credential_query())
+async def get_active_upstream_credential(
+    db: AsyncSession, credential_id: int | None = None
+) -> UpstreamCredential | None:
+    query = active_upstream_credential_query()
+    if credential_id is not None:
+        query = query.where(UpstreamCredential.id == credential_id)
+    result = await db.execute(query.execution_options(populate_existing=True))
     credential = result.scalars().first()
     if not credential:
         return None
@@ -305,11 +360,11 @@ async def get_active_upstream_credential(db: AsyncSession) -> UpstreamCredential
     ):
         try:
             async with database_lock(
-                "oauth-refresh", settings.upstream_timeout_seconds + 5
+                f"oauth-refresh-{credential.id}", settings.upstream_timeout_seconds + 5
             ):
                 # Another process may have refreshed while this request waited.
                 await db.refresh(credential)
-                if credential.deleted_at is not None:
+                if credential.deleted_at is not None or not credential.enabled:
                     return None
                 if (
                     credential.expires_at

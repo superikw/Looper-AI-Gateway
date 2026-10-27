@@ -89,6 +89,42 @@ async def initialize_database() -> None:
             await conn.execute(
                 text("ALTER TABLE upstream_credentials ADD COLUMN deleted_at DATETIME")
             )
+        additions = {
+            "name": "VARCHAR(128)",
+            "enabled": "BOOLEAN NOT NULL DEFAULT 1",
+            "cooldown_until": "DATETIME",
+            "last_used_at": "DATETIME",
+            "request_count": "INTEGER NOT NULL DEFAULT 0",
+            "failure_count": "INTEGER NOT NULL DEFAULT 0",
+            "prompt_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "completion_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "total_tokens": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for field, sql_type in additions.items():
+            if field not in credential_columns:
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE upstream_credentials ADD COLUMN {field} {sql_type}"
+                    )
+                )
+        for table in ("api_keys", "usage_logs"):
+            current_columns = await conn.run_sync(
+                lambda c: {col["name"] for col in inspect(c).get_columns(table)}
+            )
+            if "upstream_credential_id" not in current_columns:
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE {table} ADD COLUMN upstream_credential_id INTEGER REFERENCES upstream_credentials(id)"
+                    )
+                )
+        if not (
+            await conn.execute(
+                text("SELECT version FROM schema_migrations WHERE version = 4")
+            )
+        ).first():
+            await conn.execute(
+                text("INSERT INTO schema_migrations (version) VALUES (4)")
+            )
         if not (
             await conn.execute(
                 text("SELECT version FROM schema_migrations WHERE version = 3")

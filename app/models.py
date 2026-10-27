@@ -31,6 +31,9 @@ class ApiKey(Base):
     key_preview: Mapped[str] = mapped_column(String(32))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    upstream_credential_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstream_credentials.id"), nullable=True
+    )
     request_count: Mapped[int] = mapped_column(Integer, default=0)
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -47,6 +50,9 @@ class UsageLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     api_key_id: Mapped[int] = mapped_column(ForeignKey("api_keys.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    upstream_credential_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upstream_credentials.id"), nullable=True, index=True
+    )
     path: Mapped[str] = mapped_column(String(64))
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status_code: Mapped[int] = mapped_column(Integer)
@@ -82,6 +88,17 @@ class UpstreamCredential(Base):
     provider: Mapped[str] = mapped_column(String(32), index=True)
     auth_mode: Mapped[str] = mapped_column(String(32), default="oauth_manual")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    request_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failure_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    completion_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     access_token: Mapped[str] = mapped_column(EncryptedText())
     refresh_token: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     token_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
