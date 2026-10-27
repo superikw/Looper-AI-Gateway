@@ -536,6 +536,16 @@ async def test_sse_without_content_type_header_is_still_decoded():
     assert (await read_upstream_data(response))["id"] == "resp_no_content_type"
 
 
+async def test_untyped_sse_stream_uses_incremental_path(client, key, upstream):
+    upstream["content_type"] = ""
+    response = await client.post(
+        "/v1/chat/completions", headers=AUTH, json={**BASE, "stream": True}
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "data: [DONE]" in response.text
+
+
 async def test_upstream_http_error_is_preserved(client, key, upstream):
     upstream.update(
         status=429,

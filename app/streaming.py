@@ -189,10 +189,11 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
     response = await open_upstream(path, payload, db, api_key.upstream_credential_id)
     rid = request_id(response)
     cid = account_id_for_response(response)
+    content_type = response.headers.get("content-type", "")
     try:
         if (
             response.status_code >= 400
-            or "text/event-stream" not in response.headers.get("content-type", "")
+            or (content_type and "text/event-stream" not in content_type)
         ):
             data = await read_upstream_data(response)
             code, result = format_upstream_result(
