@@ -23,6 +23,7 @@ from app.protocol import (
     ResponseAccumulator,
     build_codex_request_body,
     decode_sse_data,
+    extract_sse_json,
     normalize_codex_response_to_chat,
     normalize_codex_response_to_responses,
     reject_constant,
@@ -356,6 +357,10 @@ async def read_upstream_data(response: httpx.Response) -> dict:
         await response.aread()
     except httpx.RequestError as exc:
         raise network_error(exc) from None
+    if response.status_code < 400:
+        raw_text = response.content.decode("utf-8", errors="replace")
+        if raw_text.lstrip().startswith("data:"):
+            return extract_sse_json(raw_text)
     try:
         data = response.json(parse_constant=reject_constant)
     except ValueError:

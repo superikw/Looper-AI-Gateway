@@ -9,6 +9,7 @@ from app.db import AsyncSessionLocal
 from app.models import UpstreamCredential, UsageLog
 from app.protocol import build_codex_request_body, extract_sse_json, parse_sse_events
 from app.proxy_schemas import validate_proxy_payload
+from app.services import read_upstream_data
 
 AUTH = {"Authorization": "Bearer gtw_test"}
 BASE = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hello"}]}
@@ -515,6 +516,24 @@ async def test_malformed_upstream_is_502(client, key, upstream, options):
     response = await client.post("/v1/chat/completions", headers=AUTH, json=BASE)
     assert response.status_code == 502
     assert "error" in response.json()
+
+
+async def test_sse_without_content_type_header_is_still_decoded():
+    response = httpx.Response(
+        200,
+        content=events(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_no_content_type",
+                    "status": "completed",
+                    "output": [],
+                    "output_text": "ok",
+                },
+            }
+        ).encode(),
+    )
+    assert (await read_upstream_data(response))["id"] == "resp_no_content_type"
 
 
 async def test_upstream_http_error_is_preserved(client, key, upstream):
