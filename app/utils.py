@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from datetime import UTC, datetime
 from typing import Optional
+
+
+def utcnow() -> datetime:
+    """Naive UTC preserves compatibility with existing SQLite DateTime columns."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def make_api_key(prefix: str = "gtw") -> str:
