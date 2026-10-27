@@ -86,6 +86,7 @@ python -m app.main
 | `UPSTREAM_MAX_ATTEMPTS` | 账号池每个请求最多尝试的不同账号数，默认 3，范围 1–10；固定绑定只尝试一个 |
 | `UPSTREAM_FAILURE_COOLDOWN_SECONDS` | 连接或服务端错误后的冷却秒数，默认 10 |
 | `UPSTREAM_RATE_LIMIT_COOLDOWN_SECONDS` | 429 缺少有效 Retry-After 时的冷却秒数，默认 60 |
+| `UPSTREAM_CAPACITY_WAIT_SECONDS` | RPM、并发或最小间隔受限时最多等待的秒数，默认 15；设为 0 立即返回 429 |
 | `MAX_REQUEST_BYTES` | 请求体大小限制，默认 16777216 字节（16 MiB） |
 | `DEFAULT_ALLOWED_MODELS` | 全局模型白名单，留空表示不限制；模型名会规范化 |
 | `DEFAULT_INSTRUCTIONS` | 缺少指令时使用的默认提示 |
@@ -140,7 +141,37 @@ python manage.py logout --credential-id 1
 python manage.py list-upstreams --include-deleted
 ```
 
-未绑定的 Key 按最近使用时间轮换启用、未删除且不在冷却中的账号。选择记录保存在数据库中，同一主机多个 worker 共享调度顺序，重启后也会保留。暂停、删除或冷却中的账号不会接收新的调度；已经发出的请求会继续处理。
+未绑定的 Key 按最近使用时间轮换启用、未删除、不在冷却中且有请求名额的账号。选择记录保存在数据库中，同一主机多个 worker 共享调度顺序，重启后也会保留。暂停、删除或冷却中的账号不会接收新的调度；已经发出的请求会继续处理。
+
+每个 OAuth 账号默认使用以下限额，已有账号升级后也采用相同默认值：
+
+| 账号配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `max_rpm` | 30 | 滚动 60 秒内最多调度 30 次，不在整分钟边界重置 |
+| `max_concurrency` | 4 | 最多同时占用 4 个请求名额；流式请求直到上游响应关闭才释放 |
+| `min_interval_seconds` | 0 | 默认没有最小间隔，可动态设置非负秒数 |
+
+账号限额是该账号被所有 Key 使用的总和，普通请求、流式请求和固定绑定请求均受约束。每次调度先预约 RPM 和并发名额，实际发送时更新计时，慢刷新不会使预约提前过期。重试、刷新失败和连接失败也会消耗一次调度名额；释放并发不会退还当前窗口内的 RPM。
+
+限额配置持久化在数据库中，可按账号动态更新，无需重启。后续调度和等待中的请求读取最新配置；降低上限不会中断已经获准执行的请求，已有请求结束或当前窗口消退后再接收新请求。重新登录同一未删除账号会保留其限额设置。
+
+```bash
+python manage.py update-upstream 1 --max-rpm 30 --max-concurrency 4 --min-interval-seconds 0
+python manage.py list-upstreams
+```
+
+也可以通过管理员接口修改：
+
+```bash
+curl -X PATCH http://127.0.0.1:34567/admin/upstreams/1 \
+  -H 'Authorization: Bearer 你的ADMIN_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{"max_rpm":30,"max_concurrency":4,"min_interval_seconds":0}'
+```
+
+账号池会优先选择有名额的账号；所有候选账号均满额时，最多等待 `UPSTREAM_CAPACITY_WAIT_SECONDS`，仍无名额则返回 429 和 `Retry-After`。固定绑定只等待绑定账号，不会转给其他账号。因本地限额返回的 429 不会触发上游账号冷却；禁用、删除或全部冷却仍返回 503。短时满额不会单独使 `/readyz` 失败。
+
+RPM 历史和并发预约在同一主机的 worker 间共享，重启不会清空最近一分钟的 RPM。正在处理的请求持有独立进程锁，长流式响应不会因固定租期到期而失去名额；进程异常退出后，后续调度会回收其并发名额。已结束且超过一分钟的预约与锁文件会在调度时清理。
 
 收到明确的 HTTP 401、403、429、500、502、503、504，或建立连接失败时，未绑定请求会在尝试次数内改用其他账号，每个账号最多尝试一次。401/403 冷却 300 秒；429 优先遵循 Retry-After（秒数或 HTTP 日期，限制为 1 秒至 1 天），其他错误使用配置的冷却时间。并发错误不会缩短已有冷却；管理员可手动清除。`/readyz` 至少需要一个可用账号，全部冷却时返回 503。
 
@@ -154,7 +185,7 @@ python manage.py bind-key 1 --upstream-id 2
 python manage.py bind-key 1 --auto
 ```
 
-固定绑定的账号不可用时，该 Key 返回 503，不会使用其他账号；首次收到的上游 HTTP 错误仍保留其状态码。绑定为 `null`（CLI 的 `--auto`）表示恢复账号池调度。旧 Key 自动使用账号池，无需重新创建。
+固定绑定的账号禁用、删除或冷却时，该 Key 返回 503；请求名额不足并等待超时则返回 429。均不会使用其他账号；首次收到的上游 HTTP 错误仍保留其状态码。绑定为 `null`（CLI 的 `--auto`）表示恢复账号池调度。旧 Key 自动使用账号池，无需重新创建。
 
 管理员 HTTP 接口也支持上述操作：
 
@@ -162,7 +193,7 @@ python manage.py bind-key 1 --auto
 | --- | --- |
 | `POST /admin/auth/codex/oauth/complete` | 保存账号，支持可选 `name` |
 | `GET /admin/upstreams` | 账号状态、冷却时间与用量；`include_deleted=true` 包含历史记录，不返回凭证 |
-| `PATCH /admin/upstreams/{id}` | 修改 `name`、`enabled` 或设置 `reset_cooldown=true` |
+| `PATCH /admin/upstreams/{id}` | 修改 `name`、`enabled`、`max_rpm`、`max_concurrency`、`min_interval_seconds` 或设置 `reset_cooldown=true` |
 | `DELETE /admin/upstreams/{id}` | 退出指定账号，保留历史记录 |
 | `POST /admin/keys` | 创建 Key，可选 `upstream_credential_id` |
 | `PATCH /admin/keys/{id}/upstream` | 设置 `upstream_credential_id`，传 `null` 取消绑定 |
@@ -214,7 +245,7 @@ curl -N http://127.0.0.1:34567/v1/chat/completions \
 
 ## 升级、存储与日志
 
-启动服务和执行数据库管理命令时，会自动执行幂等迁移并记录 schema 版本：添加软删除、账号池、Key 绑定及用量归属字段，把旧版上游凭证和 OAuth verifier 转为加密值。现有账号保留并默认启用，新增账号计数初始化为零。升级前先备份数据库。
+启动服务和执行数据库管理命令时，会自动执行幂等迁移并记录 schema 版本：添加软删除、账号池、账号请求限额、Key 绑定及用量归属字段，把旧版上游凭证和 OAuth verifier 转为加密值。现有账号保留并默认启用，新增账号计数初始化为零。升级前先备份数据库。
 
 迁移每批处理 256 条记录，在 Python 中加密后通过 `executemany` 批量写入。未变化的密文和已清理的回调不会重复改写；密钥校验失败会回滚迁移。
 
@@ -239,4 +270,4 @@ ruff check app manage.py tests
 ruff format --check app manage.py tests
 ```
 
-测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新与账号轮换、故障冷却、Key 绑定、账号用量归属、工具与图片转换、SSE 拆包、流式取消和就绪检查。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查。
+测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新与账号轮换、滚动 RPM、并发上限、动态限额、崩溃回收、故障冷却、Key 绑定、账号用量归属、工具与图片转换、SSE 拆包、流式取消和就绪检查。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查。
