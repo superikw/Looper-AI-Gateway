@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.db import AsyncSessionLocal
-from app.models import UsageLog
+from app.models import UpstreamCredential, UsageLog
 from app.protocol import build_codex_request_body, extract_sse_json, parse_sse_events
 from app.proxy_schemas import validate_proxy_payload
 
@@ -23,6 +23,13 @@ def events(*items, sep="\n"):
 @pytest.fixture
 async def upstream(monkeypatch):
     state = {"requests": []}
+    async with AsyncSessionLocal() as db:
+        db.add(
+            UpstreamCredential(
+                provider="codex", access_token="mock-token", account_id="mock-account"
+            )
+        )
+        await db.commit()
 
     def handler(request):
         state["requests"].append(request)
@@ -58,10 +65,6 @@ async def upstream(monkeypatch):
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     monkeypatch.setattr("app.services.get_http_client", lambda: client)
 
-    async def credentials(db=None):
-        return "mock-token", "mock-account"
-
-    monkeypatch.setattr("app.services.resolve_upstream_credential", credentials)
     yield state
     await client.aclose()
 

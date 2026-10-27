@@ -3,7 +3,7 @@
 from datetime import timedelta
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, or_, select, update
 
 from app.config import settings
 from app.db import AsyncSessionLocal
@@ -74,13 +74,23 @@ async def claim_account(bound_id: int | None, excluded: set[int]) -> int | None:
 async def mark_account_failure(cid: int | None, cooldown_seconds: int) -> None:
     if cid is None:
         return
+    until = utcnow() + timedelta(seconds=cooldown_seconds)
     async with AsyncSessionLocal() as db:
         await db.execute(
             update(UpstreamCredential)
             .where(UpstreamCredential.id == cid)
             .values(
                 failure_count=UpstreamCredential.failure_count + 1,
-                cooldown_until=utcnow() + timedelta(seconds=cooldown_seconds),
+                cooldown_until=case(
+                    (
+                        or_(
+                            UpstreamCredential.cooldown_until.is_(None),
+                            UpstreamCredential.cooldown_until < until,
+                        ),
+                        until,
+                    ),
+                    else_=UpstreamCredential.cooldown_until,
+                ),
             )
         )
         await db.commit()

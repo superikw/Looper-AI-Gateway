@@ -422,7 +422,9 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
         payload["model"] = model
         if payload["stream"]:
             return await stream_to_upstream(path, payload, db, api_key)
-        status_code, data, req_id = await forward_to_upstream(path, payload, db)
+        status_code, data, req_id, cid = await forward_to_upstream(
+            path, payload, db, api_key.upstream_credential_id
+        )
     except HTTPException as exc:
         await record_usage(
             db,
@@ -432,9 +434,10 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
             exc.status_code,
             {"error": {"message": str(exc.detail)}},
             None,
+            getattr(exc, "upstream_credential_id", None),
         )
         raise
-    await record_usage(db, api_key, path, model, status_code, data, req_id)
+    await record_usage(db, api_key, path, model, status_code, data, req_id, cid)
     headers = {"x-request-id": req_id} if req_id else None
     return JSONResponse(status_code=status_code, content=data, headers=headers)
 

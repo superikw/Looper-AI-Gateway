@@ -1,4 +1,6 @@
 import asyncio
+import json
+import sys
 from datetime import timedelta
 
 import pytest
@@ -160,3 +162,379 @@ async def test_different_accounts_refresh_independently(accounts, monkeypatch):
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.fixture
+async def pool_transport(monkeypatch):
+    import httpx
+
+    state = {"requests": [], "responses": {}}
+
+    def handle(request):
+        account = request.headers["chatgpt-account-id"]
+        state["requests"].append(account)
+        outcome = state["responses"].get(account)
+        if callable(outcome):
+            return outcome(request)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is not None:
+            return httpx.Response(
+                outcome,
+                json={"error": {"message": f"HTTP {outcome}"}},
+                headers={"retry-after": "120"},
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response",
+                        "status": "completed",
+                        "output_text": account,
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                            "total_tokens": 6,
+                        },
+                    },
+                }
+            )
+            + "\n\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as transport:
+        monkeypatch.setattr("app.services.get_http_client", lambda: transport)
+        yield state
+
+
+AUTH = {"Authorization": "Bearer gtw_test"}
+BODY = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hello"}]}
+
+
+async def test_pool_rotates_and_attributes_usage(client, accounts, key, pool_transport):
+    from app.models import ApiKey, UsageLog
+
+    for _ in range(4):
+        assert (
+            await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+        ).status_code == 200
+    assert pool_transport["requests"] == ["account-0", "account-1"] * 2
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.scalars(select(UpstreamCredential).order_by(UpstreamCredential.id))
+        ).all()
+        assert [(row.request_count, row.total_tokens) for row in rows] == [
+            (2, 12),
+            (2, 12),
+        ]
+        saved = await db.get(ApiKey, key.id)
+        assert (saved.request_count, saved.total_tokens) == (4, 24)
+        assert (
+            list(
+                (
+                    await db.scalars(
+                        select(UsageLog.upstream_credential_id).order_by(UsageLog.id)
+                    )
+                ).all()
+            )
+            == accounts * 2
+        )
+
+
+async def test_rate_limited_account_fails_over_and_enters_cooldown(
+    client, accounts, key, pool_transport
+):
+    from app.models import ApiKey, UsageLog
+
+    pool_transport["responses"]["account-0"] = 429
+    response = await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "account-1"
+    assert pool_transport["requests"] == ["account-0", "account-1"]
+    async with AsyncSessionLocal() as db:
+        first = await db.get(UpstreamCredential, accounts[0])
+        assert first.failure_count == 1
+        assert (first.cooldown_until - utcnow()).total_seconds() > 110
+        assert (await db.get(ApiKey, key.id)).request_count == 1
+        assert (await db.scalar(select(UsageLog))).upstream_credential_id == accounts[1]
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 200
+    assert pool_transport["requests"] == ["account-0", "account-1", "account-1"]
+
+
+async def test_bound_key_does_not_fail_over_and_can_be_unbound(
+    client, accounts, key, pool_transport
+):
+    await client.patch(
+        f"/admin/keys/{key.id}/upstream",
+        headers=ADMIN,
+        json={"upstream_credential_id": accounts[0]},
+    )
+    for _ in range(2):
+        assert (
+            await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+        ).status_code == 200
+    pool_transport["responses"]["account-0"] = 429
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 429
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 503
+    assert pool_transport["requests"] == ["account-0"] * 3
+    await client.patch(
+        f"/admin/keys/{key.id}/upstream",
+        headers=ADMIN,
+        json={"upstream_credential_id": None},
+    )
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 200
+    assert pool_transport["requests"][-1] == "account-1"
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 502, 503, 504])
+async def test_retryable_http_failures_use_another_account(
+    client, accounts, key, pool_transport, status
+):
+    pool_transport["responses"]["account-0"] = status
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 200
+    assert pool_transport["requests"] == ["account-0", "account-1"]
+
+
+async def test_bad_request_is_not_retried(client, accounts, key, pool_transport):
+    pool_transport["responses"]["account-0"] = 400
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 400
+    assert pool_transport["requests"] == ["account-0"]
+
+
+async def test_ambiguous_timeout_is_not_replayed(client, accounts, key, pool_transport):
+    import httpx
+
+    pool_transport["responses"]["account-0"] = httpx.ReadTimeout(
+        "may have reached upstream"
+    )
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 504
+    assert pool_transport["requests"] == ["account-0"]
+
+
+async def test_connection_failure_can_fail_over(client, accounts, key, pool_transport):
+    import httpx
+
+    pool_transport["responses"]["account-0"] = httpx.ConnectError("connection refused")
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 200
+    assert pool_transport["requests"] == ["account-0", "account-1"]
+
+
+async def test_refresh_failure_only_cools_down_affected_account(
+    client, accounts, key, pool_transport, monkeypatch
+):
+    from fastapi import HTTPException
+
+    async with AsyncSessionLocal() as db:
+        account = await db.get(UpstreamCredential, accounts[0])
+        account.expires_at = utcnow() - timedelta(seconds=1)
+        await db.commit()
+
+    async def refresh(payload):
+        raise HTTPException(401, "refresh rejected")
+
+    monkeypatch.setattr("app.oauth_manual.post_oauth", refresh)
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 200
+    assert pool_transport["requests"] == ["account-1"]
+    async with AsyncSessionLocal() as db:
+        assert (await db.get(UpstreamCredential, accounts[0])).failure_count == 1
+        assert (await db.get(UpstreamCredential, accounts[1])).cooldown_until is None
+
+
+async def test_stream_failover_happens_before_output(
+    client, accounts, key, pool_transport
+):
+    from app.models import UsageLog
+    from app.protocol import parse_sse_events
+
+    pool_transport["responses"]["account-0"] = 503
+    response = await client.post(
+        "/v1/chat/completions", headers=AUTH, json={**BODY, "stream": True}
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    chunks = parse_sse_events(response.text)
+    assert any(
+        choice["delta"].get("content") == "account-1"
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert pool_transport["requests"] == ["account-0", "account-1"]
+    async with AsyncSessionLocal() as db:
+        assert (await db.scalar(select(UsageLog))).upstream_credential_id == accounts[1]
+        assert (await db.get(UpstreamCredential, accounts[1])).total_tokens == 6
+
+
+async def test_stream_failure_does_not_mix_accounts(
+    client, accounts, key, pool_transport
+):
+    import httpx
+
+    pool_transport["responses"]["account-0"] = lambda request: httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        text='data: {"type":"response.output_text.delta","delta":"partial"}\n\ndata: {"type":"response.failed","response":{"status":"failed","error":{"message":"failure"}}}\n\n',
+    )
+    response = await client.post(
+        "/v1/chat/completions", headers=AUTH, json={**BODY, "stream": True}
+    )
+    assert "partial" in response.text and "failure" in response.text
+    assert pool_transport["requests"] == ["account-0"]
+    async with AsyncSessionLocal() as db:
+        assert (await db.get(UpstreamCredential, accounts[0])).failure_count == 1
+
+
+async def test_all_cooling_accounts_are_unready_until_reset(
+    client, accounts, key, pool_transport
+):
+    pool_transport["responses"].update({"account-0": 429, "account-1": 429})
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 429
+    assert (await client.get("/readyz")).status_code == 503
+    assert (
+        await client.patch(
+            f"/admin/upstreams/{accounts[0]}",
+            headers=ADMIN,
+            json={"reset_cooldown": True},
+        )
+    ).status_code == 200
+    assert (await client.get("/readyz")).status_code == 200
+
+
+async def test_claims_are_balanced_under_concurrency_and_persist(accounts):
+    from app.db import engine
+    from app.upstreams import claim_account
+
+    claims = await asyncio.gather(*(claim_account(None, set()) for _ in range(20)))
+    assert claims.count(accounts[0]) == claims.count(accounts[1]) == 10
+    await engine.dispose()
+    assert await claim_account(None, set()) == accounts[0]
+
+
+async def test_late_failure_does_not_shorten_rate_limit_cooldown(accounts):
+    from app.upstreams import mark_account_failure
+
+    await mark_account_failure(accounts[0], 120)
+    await mark_account_failure(accounts[0], 10)
+    async with AsyncSessionLocal() as db:
+        row = await db.get(UpstreamCredential, accounts[0])
+        assert row.failure_count == 2
+        assert (row.cooldown_until - utcnow()).total_seconds() > 110
+
+
+async def test_pool_selection_is_shared_across_processes(accounts):
+    script = """
+import asyncio, json
+from app.upstreams import claim_account
+from app.db import engine
+async def run():
+    claims = [await claim_account(None, set()) for _ in range(6)]
+    await engine.dispose()
+    print(json.dumps(claims))
+asyncio.run(run())
+"""
+    processes = [
+        await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        for _ in range(2)
+    ]
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*(process.communicate() for process in processes)), 20
+        )
+        claims = []
+        for process, (stdout, stderr) in zip(processes, results):
+            assert process.returncode == 0, stderr.decode()
+            claims.extend(json.loads(stdout))
+        assert claims.count(accounts[0]) == claims.count(accounts[1]) == 6
+    finally:
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+
+async def test_attempt_limit_and_disabled_binding(
+    client, accounts, key, pool_transport, monkeypatch
+):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "upstream_max_attempts", 1)
+    pool_transport["responses"]["account-0"] = 503
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 503
+    assert pool_transport["requests"] == ["account-0"]
+    await client.patch(
+        f"/admin/keys/{key.id}/upstream",
+        headers=ADMIN,
+        json={"upstream_credential_id": accounts[1]},
+    )
+    await client.patch(
+        f"/admin/upstreams/{accounts[1]}",
+        headers=ADMIN,
+        json={"enabled": False},
+    )
+    assert (
+        await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
+    ).status_code == 503
+    assert pool_transport["requests"] == ["account-0"]
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [("120", 120), ("garbage", 60), ("nan", 60), ("-1", 1), ("999999", 86400)],
+)
+def test_retry_after_bounds(value, expected):
+    import httpx
+
+    from app.services import cooldown_for_response
+
+    assert (
+        cooldown_for_response(httpx.Response(429, headers={"retry-after": value}))
+        == expected
+    )
+
+
+def test_retry_after_http_date():
+    from datetime import UTC, datetime
+    from email.utils import format_datetime
+
+    import httpx
+
+    from app.services import cooldown_for_response
+
+    future = format_datetime(datetime.now(UTC) + timedelta(seconds=120), usegmt=True)
+    assert (
+        119
+        <= cooldown_for_response(httpx.Response(429, headers={"retry-after": future}))
+        <= 120
+    )

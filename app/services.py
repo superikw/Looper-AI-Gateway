@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -10,9 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.codex_auth import CodexAuthError, codex_auth_manager
 from app.config import settings
+from app.db import AsyncSessionLocal
 from app.http_client import get_http_client
 from app.model_utils import canonicalize_model_name
-from app.models import ApiKey, UsageLog
+from app.models import ApiKey, UpstreamCredential, UsageLog
 from app.oauth_manual import get_active_upstream_credential
 from app.protocol import (
     ResponseAccumulator,
@@ -25,6 +29,7 @@ from app.protocol import (
     validate_upstream_data,
 )
 from app.token_utils import extract_account_id_from_token
+from app.upstreams import claim_account, mark_account_failure
 
 
 def log_debug(event: str, **kwargs: Any) -> None:
@@ -76,16 +81,33 @@ def network_error(exc: httpx.RequestError) -> HTTPException:
     return HTTPException(502, "upstream connection failed")
 
 
-async def open_upstream(
-    path: str, payload: dict[str, Any], db: AsyncSession | None = None
+def account_id_for_response(response: httpx.Response) -> int | None:
+    return response.extensions.get("gateway_credential_id")
+
+
+def cooldown_for_response(response: httpx.Response) -> int:
+    if response.status_code in (401, 403):
+        return 300
+    if response.status_code == 429:
+        value = response.headers.get("retry-after", "")
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                delay = (
+                    parsedate_to_datetime(value).astimezone(UTC) - datetime.now(UTC)
+                ).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                delay = settings.upstream_rate_limit_cooldown_seconds
+        if not math.isfinite(delay):
+            delay = settings.upstream_rate_limit_cooldown_seconds
+        return max(1, min(math.ceil(delay), 86400))
+    return settings.upstream_failure_cooldown_seconds
+
+
+async def _send_upstream(
+    path: str, body: dict, bearer: str, account: str
 ) -> httpx.Response:
-    body = build_codex_request_body(path, payload)
-    bearer, account = await resolve_upstream_credential(db)
-    account = account or extract_account_id_from_token(bearer)
-    if not account:
-        raise HTTPException(
-            502, "upstream credential does not contain a ChatGPT account ID"
-        )
     url = f"{settings.upstream_base_url.rstrip('/')}/codex/responses"
     headers = {
         "Authorization": f"Bearer {bearer}",
@@ -97,12 +119,9 @@ async def open_upstream(
     }
     log_debug("upstream_request", path=path, model=body["model"])
     client = get_http_client()
-    try:
-        response = await client.send(
-            client.build_request("POST", url, headers=headers, json=body), stream=True
-        )
-    except httpx.RequestError as exc:
-        raise network_error(exc) from None
+    response = await client.send(
+        client.build_request("POST", url, headers=headers, json=body), stream=True
+    )
     log_debug(
         "upstream_response",
         path=path,
@@ -110,6 +129,99 @@ async def open_upstream(
         request_id=request_id(response),
     )
     return response
+
+
+async def open_upstream(
+    path: str,
+    payload: dict[str, Any],
+    db: AsyncSession | None = None,
+    upstream_credential_id: int | None = None,
+) -> httpx.Response:
+    body = build_codex_request_body(path, payload)
+    if settings.upstream_auth_mode != "oauth_manual":
+        if upstream_credential_id is not None:
+            raise HTTPException(503, "account bindings require oauth_manual mode")
+        bearer, account = await resolve_upstream_credential(db)
+        account = account or extract_account_id_from_token(bearer)
+        if not account:
+            raise HTTPException(
+                502, "upstream credential does not contain a ChatGPT account ID"
+            )
+        try:
+            return await _send_upstream(path, body, bearer, account)
+        except httpx.RequestError as exc:
+            raise network_error(exc) from None
+    if db is None:
+        raise HTTPException(500, "database session required for oauth_manual mode")
+    excluded: set[int] = set()
+    last_response = None
+    last_error = None
+    attempts = (
+        1 if upstream_credential_id is not None else settings.upstream_max_attempts
+    )
+    for attempt in range(attempts):
+        cid = await claim_account(upstream_credential_id, excluded)
+        if cid is None:
+            break
+        excluded.add(cid)
+        try:
+            async with AsyncSessionLocal() as credential_db:
+                credential = await get_active_upstream_credential(credential_db, cid)
+                if not credential:
+                    raise HTTPException(503, "selected upstream account is unavailable")
+                bearer = credential.access_token
+                account = credential.account_id or extract_account_id_from_token(bearer)
+                if not account:
+                    raise HTTPException(
+                        502, "upstream credential does not contain a ChatGPT account ID"
+                    )
+        except HTTPException as exc:
+            exc.upstream_credential_id = cid
+            last_error = exc
+            await mark_account_failure(
+                cid,
+                300
+                if exc.status_code == 401
+                else settings.upstream_failure_cooldown_seconds,
+            )
+            continue
+        try:
+            response = await _send_upstream(path, body, bearer, account)
+        except httpx.RequestError as exc:
+            error = network_error(exc)
+            error.upstream_credential_id = cid
+            await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
+            # Only connection failures guarantee the model never received the
+            # request. A read/write timeout may already have consumed tokens.
+            if isinstance(
+                exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+            ):
+                last_error = error
+                continue
+            raise error from None
+        response.extensions["gateway_credential_id"] = cid
+        if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
+            return response
+        await mark_account_failure(cid, cooldown_for_response(response))
+        if attempt == attempts - 1:
+            return response
+        try:
+            await response.aread()
+        except httpx.RequestError as exc:
+            error = network_error(exc)
+            error.upstream_credential_id = cid
+            raise error from None
+        finally:
+            await response.aclose()
+        last_response = response
+    if last_response is not None:
+        return last_response
+    if last_error is not None:
+        raise last_error
+    raise HTTPException(
+        503,
+        "no available upstream accounts; check bindings, enabled state and cooldowns",
+    )
 
 
 def request_id(response: httpx.Response) -> str | None:
@@ -185,13 +297,24 @@ async def read_upstream_data(response: httpx.Response) -> dict:
 
 
 async def forward_to_upstream(
-    path: str, payload: dict[str, Any], db: AsyncSession | None = None
-) -> tuple[int, dict[str, Any], str | None]:
-    response = await open_upstream(path, payload, db)
+    path: str,
+    payload: dict[str, Any],
+    db: AsyncSession | None = None,
+    upstream_credential_id: int | None = None,
+) -> tuple[int, dict[str, Any], str | None, int | None]:
+    response = await open_upstream(path, payload, db, upstream_credential_id)
+    cid = account_id_for_response(response)
     try:
         data = await read_upstream_data(response)
         code, result = format_upstream_result(path, payload, response.status_code, data)
-        return code, result, request_id(response)
+        if code >= 400 and response.status_code < 400:
+            await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
+        return code, result, request_id(response), cid
+    except HTTPException as exc:
+        exc.upstream_credential_id = cid
+        if response.status_code < 400:
+            await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
+        raise
     finally:
         await response.aclose()
 
@@ -204,6 +327,7 @@ async def record_usage(
     status_code: int,
     response_json: dict[str, Any],
     upstream_request_id: str | None,
+    upstream_credential_id: int | None = None,
 ) -> None:
     usage = response_json.get("usage") or {}
     prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
@@ -223,6 +347,19 @@ async def record_usage(
         )
         .execution_options(synchronize_session=False)
     )
+
+    if upstream_credential_id is not None:
+        await db.execute(
+            update(UpstreamCredential)
+            .where(UpstreamCredential.id == upstream_credential_id)
+            .values(
+                prompt_tokens=UpstreamCredential.prompt_tokens + prompt_tokens,
+                completion_tokens=UpstreamCredential.completion_tokens
+                + completion_tokens,
+                total_tokens=UpstreamCredential.total_tokens + total_tokens,
+            )
+            .execution_options(synchronize_session=False)
+        )
 
     error_message = None
     if status_code >= 400:
@@ -245,6 +382,7 @@ async def record_usage(
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             upstream_request_id=upstream_request_id,
+            upstream_credential_id=upstream_credential_id,
             error_message=error_message,
         )
     )

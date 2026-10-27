@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from app.config import settings
 from app.db import AsyncSessionLocal
 from app.protocol import (
     ResponseAccumulator,
@@ -16,6 +17,7 @@ from app.protocol import (
     response_failed,
 )
 from app.services import (
+    account_id_for_response,
     format_upstream_result,
     iter_upstream_events,
     open_upstream,
@@ -23,6 +25,7 @@ from app.services import (
     record_usage,
     request_id,
 )
+from app.upstreams import mark_account_failure
 
 
 def sse(data: dict, event: str | None = None) -> str:
@@ -181,8 +184,9 @@ class ChatStream:
 
 
 async def stream_to_upstream(path: str, payload: dict, db, api_key):
-    response = await open_upstream(path, payload, db)
+    response = await open_upstream(path, payload, db, api_key.upstream_credential_id)
     rid = request_id(response)
+    cid = account_id_for_response(response)
     try:
         if (
             response.status_code >= 400
@@ -193,9 +197,13 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                 path, payload, response.status_code, data
             )
             if code >= 400:
+                if response.status_code < 400:
+                    await mark_account_failure(
+                        cid, settings.upstream_failure_cooldown_seconds
+                    )
                 await response.aclose()
                 await record_usage(
-                    db, api_key, path, payload["model"], code, result, rid
+                    db, api_key, path, payload["model"], code, result, rid, cid
                 )
                 return JSONResponse(result, status_code=code)
 
@@ -211,12 +219,21 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
             initial.add(first)
         if first is None or (initial.terminal and response_failed(initial.result())):
             code, result = format_upstream_result(path, payload, 200, initial.result())
+            await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
             await response.aclose()
-            await record_usage(db, api_key, path, payload["model"], code, result, rid)
+            await record_usage(
+                db, api_key, path, payload["model"], code, result, rid, cid
+            )
             return JSONResponse(result, status_code=code)
-    except BaseException:
+    except BaseException as exc:
         with anyio.CancelScope(shield=True):
             await response.aclose()
+            if isinstance(exc, HTTPException):
+                exc.upstream_credential_id = cid
+                if response.status_code < 400:
+                    await mark_account_failure(
+                        cid, settings.upstream_failure_cooldown_seconds
+                    )
         raise
 
     accumulator = ResponseAccumulator()
@@ -238,6 +255,10 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
         # A fresh session and a cancellation shield preserve the final audit row.
         with anyio.CancelScope(shield=True):
             await response.aclose()
+            if state["code"] >= 400 and state["code"] != 499:
+                await mark_account_failure(
+                    cid, settings.upstream_failure_cooldown_seconds
+                )
             async with AsyncSessionLocal() as usage_db:
                 await record_usage(
                     usage_db,
@@ -247,6 +268,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                     state["code"],
                     state["data"],
                     rid,
+                    cid,
                 )
 
     async def body():
