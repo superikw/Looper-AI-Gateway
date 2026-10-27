@@ -41,7 +41,7 @@ Chat Completions 支持 `tools` / `tool_choice`、`parallel_tool_calls`、`tempe
 
 ## 部署
 
-以下步骤从首次安装到实际调用依次执行。除 SSH 隧道和浏览器操作外，所有命令均在 **Linux 服务器**执行；下载代码后，所有 `docker compose` 命令均在项目目录执行。
+以下步骤从首次安装到实际调用依次执行。除 SSH 隧道和浏览器操作外，所有命令均在 **Linux 服务器**执行；下载代码后，所有 `docker compose` 命令均在项目目录执行。使用 Podman 的命令差异见[使用 podman-compose](#使用-podman-compose)。
 
 ```text
 客户端 → Gateway（服务器 127.0.0.1:34567）→ WARP（容器内 1080）→ 上游
@@ -86,7 +86,8 @@ cp .env.docker.example .env
 ### 3. 生成并填写管理员口令
 
 ```bash
-docker compose run --rm --no-deps --build looper-ai-gateway \
+docker compose build looper-ai-gateway
+docker compose run --rm --no-deps looper-ai-gateway \
   python manage.py generate-admin-token
 ```
 
@@ -112,7 +113,7 @@ WARP_SLEEP=5
 ### 4. 启动服务并验证 WARP
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 docker compose ps
 ```
 
@@ -246,6 +247,45 @@ ssh -N -L 34567:127.0.0.1:34567 用户名@服务器IP
 | 模型 | 已通过第 7 步验证的模型 |
 
 如需域名访问，可在服务器配置 Nginx/Caddy HTTPS 反向代理到 `127.0.0.1:34567`。流式接口需关闭代理缓冲，并为长请求设置足够的读取超时。
+
+### 使用 podman-compose
+
+`podman-compose` 与 Docker Compose 的参数支持随版本不同。例如 [podman-compose 1.0.6](https://github.com/containers/podman-compose/blob/v1.0.6/podman_compose.py) 的 `run` 不接受 `--build`。构建和启动分开执行即可避免依赖这一参数，`--build` 也不能放在子命令前面。
+
+先按第 2 步下载项目、创建 `.env`，然后在项目目录执行：
+
+```bash
+podman --version
+podman-compose version
+podman-compose build looper-ai-gateway
+podman-compose run --rm --no-deps looper-ai-gateway \
+  python manage.py generate-admin-token
+```
+
+将生成的口令填入 `.env` 的 `ADMIN_TOKEN`，再启动：
+
+```bash
+podman-compose up -d
+podman-compose ps
+podman-compose logs --tail=100 warp looper-ai-gateway
+```
+
+后续登录和管理命令，将文中的 `docker compose` 前缀换成 `podman-compose`，例如：
+
+```bash
+podman-compose exec looper-ai-gateway python manage.py auth-start
+podman-compose exec looper-ai-gateway python manage.py list-upstreams
+```
+
+更新镜像与启动也分步执行：
+
+```bash
+podman-compose pull warp
+podman-compose build looper-ai-gateway
+podman-compose up -d
+```
+
+所有 Podman 命令保持使用同一用户执行。上述方式解决 CLI 参数差异，WARP 仍需前文的 TUN 与容器权限；Podman 上的真实隧道运行尚未端到端验证。
 
 ## 多账号池与固定绑定
 
@@ -423,12 +463,13 @@ sudo tar -czf "../looper-backups/looper-$(date +%Y%m%d-%H%M%S).tar.gz" \
 ```bash
 git pull --ff-only
 docker compose pull warp
-docker compose up -d --build
+docker compose build looper-ai-gateway
+docker compose up -d
 docker compose ps
 curl -f http://127.0.0.1:34567/readyz
 ```
 
-再执行一次实际 API 请求验证。更新时保留原 `.env` 和数据目录；新版本增加配置时参考 `.env.docker.example` 补充。之前使用双 Compose 文件的部署，更新后也统一使用 `docker compose up -d --build`。
+再执行一次实际 API 请求验证。更新时保留原 `.env` 和数据目录；新版本增加配置时参考 `.env.docker.example` 补充。之前使用双 Compose 文件的部署，更新后也统一使用单个 `docker-compose.yml`，按上述命令分步构建和启动。
 
 启动服务和执行数据库管理命令时会自动进行幂等迁移，包括旧凭证加密、软删除、账号池及限额字段。迁移按 schema 版本执行，密钥校验失败会回滚。不要把旧代码直接指向已升级数据库作为回滚方案；需要回滚时使用与备份兼容的代码和数据。
 
@@ -451,7 +492,8 @@ sudo tar -xzf /绝对路径/looper-backups/looper-备份时间.tar.gz -C "$PWD"
 确认解压成功后再启动并验证：
 
 ```bash
-docker compose up -d --build
+docker compose build looper-ai-gateway
+docker compose up -d
 docker compose ps
 curl -f http://127.0.0.1:34567/readyz
 ```
@@ -468,7 +510,8 @@ docker compose logs -f --tail=100 warp looper-ai-gateway
 docker compose stop
 
 # 按当前配置启动或更新容器
-docker compose up -d --build
+docker compose build looper-ai-gateway
+docker compose up -d
 
 # 停止并删除容器及默认网络，保留宿主机数据目录
 docker compose down
