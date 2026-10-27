@@ -118,7 +118,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Gateway 会等待 WARP 健康检查通过后启动。正常情况下两个服务都为运行状态，健康状态最终显示 `healthy`。
+Gateway 会在 WARP 容器创建后启动，不会因为 WARP 首次注册或健康检查长时间处于 `starting` 而阻塞 Compose。正常情况下两个服务都应运行，健康状态最终显示 `healthy`；WARP 就绪前发送上游请求会返回代理不可用错误。
 
 查看 WARP 实际出口：
 
@@ -276,7 +276,7 @@ podman-compose ps
 podman-compose logs --tail=100 warp looper-ai-gateway
 ```
 
-1.0.6 不会按 Docker Compose 的行为等待 `condition: service_healthy`，启动后应按第 4 步通过 Cloudflare trace 确认 WARP 出口可用，再登录账号和调用模型。
+启动后应按第 4 步通过 Cloudflare trace 确认 WARP 出口可用，再登录账号和调用模型。Compose 保留 WARP 健康检查用于状态显示，但不把 Gateway 启动绑定到该条件，避免首次注册或 Podman 健康检查卡住整个启动命令。
 
 后续登录和管理命令，将文中的 `docker compose` 前缀换成 `podman-compose`，例如：
 
@@ -620,7 +620,7 @@ docker compose exec warp sh /usr/local/bin/warp-healthcheck.sh
 
 手动健康检查成功时无输出且退出码为 0。健康检查会通过 HTTP 代理访问 Cloudflare trace，仅在实际出口为 `warp=on` 或 `warp=plus` 时通过。检查 TUN、`NET_ADMIN` 权限和服务器出站网络；WARP 运行配置参考 [warp-docker 项目](https://github.com/cmj2002/warp-docker)。
 
-Gateway 只在启动时等待 WARP 健康。WARP 运行中变为 unhealthy 不会自动停止或重启 Gateway，需结合日志与实际代理请求判断。
+Gateway 只依赖 WARP 容器先创建，不会在 Compose 层无限等待健康条件。WARP 运行中变为 unhealthy 不会自动停止或重启 Gateway，需结合日志与实际代理请求判断。
 
 ### 健康检查正常，但无法调用模型
 

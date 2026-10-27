@@ -40,9 +40,10 @@ services:
       HTTP_PROXY: http://warp:1080
       HTTPS_PROXY: http://warp:1080
       NO_PROXY: localhost,127.0.0.1,::1
+    # Do not gate Gateway creation on WARP health. podman-compose can wait
+    # indefinitely during first-run WARP registration or TUN initialization.
     depends_on:
-      warp:
-        condition: service_healthy
+      - warp
     ports:
       - "127.0.0.1:34567:8080"
     volumes:
