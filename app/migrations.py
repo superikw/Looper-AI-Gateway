@@ -6,6 +6,63 @@ from app.crypto import PREFIX, cipher, decrypt, encrypt
 from app.db import Base, engine
 from app.locks import database_lock
 
+MIGRATION_BATCH_SIZE = 256
+
+
+async def migrate_encrypted_rows(conn, table: str, fields: list[str]) -> None:
+    """Encrypt in Python, then flush one executemany UPDATE per changed batch."""
+    columns = list(fields)
+    if table == "oauth_sessions":
+        columns += ["status", "callback_url"]
+    assignments = list(fields)
+    if table == "oauth_sessions":
+        assignments.append("callback_url")
+    update = text(
+        f"UPDATE {table} SET "
+        + ", ".join(f"{field} = :{field}" for field in assignments)
+        + " WHERE id = :id"
+    )
+    last_id = None
+    while True:
+        where = "WHERE id > :last_id" if last_id is not None else ""
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        f"SELECT id, {', '.join(columns)} FROM {table} {where} ORDER BY id LIMIT :batch_size"
+                    ),
+                    {"last_id": last_id, "batch_size": MIGRATION_BATCH_SIZE},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        if not rows:
+            break
+        updates = []
+        for row in rows:
+            values = {field: row[field] for field in assignments}
+            plaintext = {}
+            for field in fields:
+                value = row[field]
+                # Verify encrypted rows too so a wrong key still fails startup.
+                plaintext[field] = decrypt(value)
+                if value is not None and not value.startswith(PREFIX):
+                    values[field] = encrypt(value)
+            if (
+                table == "oauth_sessions"
+                and row["status"] != "pending"
+                and row["callback_url"] is not None
+            ):
+                values["callback_url"] = "received"
+                if plaintext["code_verifier"] != "":
+                    values["code_verifier"] = encrypt("")
+            if any(values[field] != row[field] for field in assignments):
+                updates.append({"id": row["id"], **values})
+        if updates:
+            await conn.execute(update, updates)
+        last_id = rows[-1]["id"]
+
 
 async def initialize_database() -> None:
     cipher()
@@ -36,33 +93,7 @@ async def initialize_database() -> None:
             ("upstream_credentials", ["access_token", "refresh_token", "raw_json"]),
             ("oauth_sessions", ["code_verifier"]),
         ]:
-            rows = (
-                (
-                    await conn.execute(
-                        text(f"SELECT id, {', '.join(fields)} FROM {table}")
-                    )
-                )
-                .mappings()
-                .all()
-            )
-            for row in rows:
-                for field in fields:
-                    value = row[field]
-                    if value is not None and not value.startswith(PREFIX):
-                        await conn.execute(
-                            text(f"UPDATE {table} SET {field} = :value WHERE id = :id"),
-                            {"id": row["id"], "value": encrypt(value)},
-                        )
-                    elif value is not None:
-                        decrypt(
-                            value
-                        )  # Fail before serving if the encryption key is wrong.
-        await conn.execute(
-            text(
-                "UPDATE oauth_sessions SET callback_url = 'received', code_verifier = :empty WHERE status != 'pending' AND callback_url IS NOT NULL"
-            ),
-            {"empty": encrypt("")},
-        )
+            await migrate_encrypted_rows(conn, table, fields)
         if not (
             await conn.execute(
                 text("SELECT version FROM schema_migrations WHERE version = 2")
