@@ -72,7 +72,7 @@ sudo modprobe tun
 ls -l /dev/net/tun
 ```
 
-服务器需允许容器使用 `NET_ADMIN`，Compose 已配置此权限及 TUN 挂载。受限 VPS、LXC 等环境如果仍提示权限不足，需要宿主机或服务商开放对应能力。
+服务器需允许容器使用 `NET_ADMIN`，Compose 已配置此权限及 TUN 挂载，并按 WARP 上游要求为 Podman 补齐 `MKNOD`、`AUDIT_WRITE`。受限 VPS、LXC 等环境如果仍提示权限不足，需要宿主机或服务商开放对应能力。
 
 ### 2. 下载项目并创建配置
 
@@ -254,6 +254,8 @@ ssh -N -L 34567:127.0.0.1:34567 用户名@服务器IP
 
 使用宿主机 OpenSSL 生成管理员口令，构建和启动分开执行，即可避开这两个问题。
 
+Compose 中的 `sysctls` 使用 `KEY=VALUE` 列表格式，兼容 1.0.6；该版本处理字典格式时会丢失值，导致 `sysctl values must be in the form of KEY=VALUE`。Gateway 健康检查使用 `CMD-SHELL` 保留 `python -c` 的引号。WARP 的 Podman 权限配置参考[上游项目](https://github.com/cmj2002/warp-docker)。
+
 先按第 2 步下载项目、创建 `.env`，然后在项目目录执行：
 
 ```bash
@@ -270,6 +272,8 @@ podman-compose up -d
 podman-compose ps
 podman-compose logs --tail=100 warp looper-ai-gateway
 ```
+
+1.0.6 不会按 Docker Compose 的行为等待 `condition: service_healthy`，启动后应按第 4 步通过 Cloudflare trace 确认 WARP 出口可用，再登录账号和调用模型。
 
 后续登录和管理命令，将文中的 `docker compose` 前缀换成 `podman-compose`，例如：
 
@@ -521,6 +525,18 @@ docker compose down
 日志输出事件名、路径、模型、HTTP 状态和上游 request ID，不输出提示词、响应正文、账号 ID 或 token。迁移不会清理已有备份或旧版日志中的敏感内容。
 
 ## 常见问题
+
+### Podman 报 sysctl 缺少 KEY=VALUE
+
+如果启动日志是 `--sysctl net.ipv6.conf.all.disable_ipv6`，缺少末尾的 `=0`，说明旧版 provider 把字典中的值丢掉了。项目已改为以下列表格式，更新代码后重新启动即可：
+
+```yaml
+sysctls:
+  - net.ipv6.conf.all.disable_ipv6=0
+  - net.ipv4.conf.all.src_valid_mark=1
+```
+
+后续的 `WARP container not found` 或依赖不存在报错是 WARP 创建失败的连带结果，先处理最早出现的 sysctl 错误。保留现有 `.env`、`data` 和 `warp-data`。
 
 ### Podman 生成管理员口令时报 WARP 依赖不存在
 

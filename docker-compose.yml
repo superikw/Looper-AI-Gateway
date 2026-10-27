@@ -5,10 +5,14 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
+      # WARP also needs these capabilities under Podman.
+      - MKNOD
+      - AUDIT_WRITE
       - NET_ADMIN
     sysctls:
-      net.ipv6.conf.all.disable_ipv6: "0"
-      net.ipv4.conf.all.src_valid_mark: "1"
+      # podman-compose 1.0.6 loses values when sysctls uses a mapping.
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
     environment:
       WARP_SLEEP: ${WARP_SLEEP:-5}
     expose:
@@ -47,7 +51,11 @@ services:
       # Replace /ABSOLUTE/PATH/TO/.codex with a real absolute path on host
       # - /ABSOLUTE/PATH/TO/.codex:/root/.codex
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"]
+      # CMD-SHELL preserves Python quoting with podman-compose 1.0.6.
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"
       interval: 30s
       timeout: 5s
       retries: 3
