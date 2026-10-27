@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hmac
+
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,10 +13,12 @@ from app.utils import sha256_text
 
 
 async def require_admin(authorization: str | None = Header(default=None)) -> None:
+    if not settings.admin_token_is_secure:
+        raise HTTPException(status_code=503, detail='administrator authentication is not configured securely')
     if not authorization or not authorization.startswith('Bearer '):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='missing admin token')
     token = authorization.removeprefix('Bearer ').strip()
-    if token != settings.admin_token:
+    if not hmac.compare_digest(token.encode(), settings.admin_token.encode()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='invalid admin token')
 
 

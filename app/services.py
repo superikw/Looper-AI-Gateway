@@ -332,10 +332,7 @@ async def forward_to_upstream(path: str, payload: dict[str, Any], db: AsyncSessi
         path=path,
         url=url,
         model=payload.get('model'),
-        account_id=account_id,
-        request_body=codex_body,
         headers={
-            'chatgpt-account-id': account_id,
             'OpenAI-Beta': settings.upstream_openai_beta,
             'originator': settings.oauth_originator,
             'accept': headers['accept'],
@@ -380,9 +377,7 @@ async def forward_to_upstream(path: str, payload: dict[str, Any], db: AsyncSessi
         status_code=resp.status_code,
         request_id=req_id,
         content_type=content_type,
-        response_preview=raw_text[:2000],
         parsed_keys=list(data.keys()) if isinstance(data, dict) else None,
-        output_text_preview=(data.get('output_text')[:200] if isinstance(data, dict) and isinstance(data.get('output_text'), str) else None),
     )
 
     if resp.status_code >= 400:

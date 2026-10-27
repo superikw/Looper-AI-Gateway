@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import OAuthSession, UpstreamCredential
+from app.http_client import post_oauth
+from app.locks import database_lock
 
 JWT_CLAIM_PATH = 'https://api.openai.com/auth'
 
@@ -128,7 +130,7 @@ def _decode_jwt_payload(access_token: str) -> dict[str, Any] | None:
 
 
 def extract_account_id(access_token: str, token_data: dict[str, Any]) -> str | None:
-    direct = token_data.get('account_id') or token_data.get('sub')
+    direct = token_data.get('account_id')
     if isinstance(direct, str) and direct:
         return direct
     payload = _decode_jwt_payload(access_token)
@@ -186,7 +188,8 @@ async def complete_oauth_session(db: AsyncSession, session_id: int, callback_url
     current.updated_at = _now()
 
     entity.status = 'completed'
-    entity.callback_url = callback_url
+    entity.callback_url = 'received'
+    entity.code_verifier = ''
     entity.completed_at = _now()
 
     await db.commit()
@@ -214,16 +217,7 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> dict[str, An
     if settings.oauth_client_secret:
         payload['client_secret'] = settings.oauth_client_secret
 
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
-        resp = await client.post(settings.oauth_token_url, data=payload, headers=headers)
-    try:
-        data = resp.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail=f'token endpoint returned non-json body: {resp.text[:400]}')
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f'token exchange failed: {data}')
-    return data
+    return await post_oauth(payload)
 
 
 async def refresh_upstream_credential(db: AsyncSession, credential: UpstreamCredential) -> UpstreamCredential:
@@ -237,15 +231,7 @@ async def refresh_upstream_credential(db: AsyncSession, credential: UpstreamCred
     }
     if settings.oauth_client_secret:
         payload['client_secret'] = settings.oauth_client_secret
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
-        resp = await client.post(settings.oauth_token_url, data=payload, headers=headers)
-    try:
-        data = resp.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail=f'refresh endpoint returned non-json body: {resp.text[:400]}')
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=401, detail=f'oauth refresh failed: {data}')
+    data = await post_oauth(payload)
 
     credential.access_token = data.get('access_token') or credential.access_token
     credential.refresh_token = data.get('refresh_token') or credential.refresh_token
@@ -266,6 +252,12 @@ async def get_active_upstream_credential(db: AsyncSession) -> UpstreamCredential
     if not credential:
         return None
     if credential.expires_at and credential.expires_at <= _now() + timedelta(seconds=90):
-        if credential.refresh_token:
-            credential = await refresh_upstream_credential(db, credential)
+        try:
+            async with database_lock('oauth-refresh', settings.upstream_timeout_seconds + 5):
+                # Another process may have refreshed while this request waited.
+                await db.refresh(credential)
+                if credential.expires_at and credential.expires_at <= _now() + timedelta(seconds=90):
+                    credential = await refresh_upstream_credential(db, credential)
+        except TimeoutError:
+            raise HTTPException(504, 'Timed out waiting for upstream credential refresh') from None
     return credential

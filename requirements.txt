@@ -8,3 +8,4 @@ python-dotenv==1.1.0
 aiosqlite==0.21.0
 orjson==3.10.18
 psutil==7.0.0
+cryptography==44.0.3

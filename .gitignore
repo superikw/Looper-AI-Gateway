@@ -4,6 +4,6 @@ __pycache__/
 .env.*
 !.env.example
 !.env.docker.example
-data/*.db
+data/
 .venv/
 .pytest_cache/

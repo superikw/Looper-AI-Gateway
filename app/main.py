@@ -18,6 +18,7 @@ from app.config import settings
 from app.db import Base, engine, get_db
 from app.models import ApiKey, OAuthSession, UpstreamCredential, User
 from app.migrations import initialize_database
+from app.http_client import close_http_client
 from app.oauth_manual import complete_oauth_session, start_oauth_session
 from app.oauth_schemas import OAuthCompleteRequest
 from app.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyOut, UserCreate, UserOut
@@ -27,9 +28,14 @@ from app.utils import make_api_key, mask_key, sha256_text
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.validate_runtime()
     Path('data').mkdir(parents=True, exist_ok=True)
     await initialize_database()
-    yield
+    try:
+        yield
+    finally:
+        await close_http_client()
+        await engine.dispose()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)

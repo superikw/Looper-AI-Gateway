@@ -12,8 +12,10 @@ class Settings(BaseSettings):
     app_name: str = Field(default='Looper-AI-Gateway', alias='APP_NAME')
     host: str = Field(default='0.0.0.0', alias='HOST')
     port: int = Field(default=8080, alias='PORT')
-    admin_token: str = Field(default='change_me_admin_token', alias='ADMIN_TOKEN')
+    admin_token: str = Field(default='', alias='ADMIN_TOKEN')
     database_url: str = Field(default='sqlite+aiosqlite:///./data/gateway.db', alias='DATABASE_URL')
+    credential_encryption_key: str = Field(default='', alias='CREDENTIAL_ENCRYPTION_KEY')
+    credential_key_file: str = Field(default='./data/credential.key', alias='CREDENTIAL_KEY_FILE')
 
     upstream_base_url: str = Field(default='https://chatgpt.com/backend-api', alias='UPSTREAM_BASE_URL')
     upstream_auth_mode: str = Field(default='oauth_manual', alias='UPSTREAM_AUTH_MODE')
@@ -41,6 +43,14 @@ class Settings(BaseSettings):
     codex_home: str = Field(default='~/.codex', alias='CODEX_HOME')
     codex_auth_credentials_store: str = Field(default='file', alias='CODEX_AUTH_CREDENTIALS_STORE')
     codex_login_log_file: str = Field(default='./data/codex-login.log', alias='CODEX_LOGIN_LOG_FILE')
+
+    def validate_runtime(self) -> None:
+        if not self.admin_token_is_secure:
+            raise ValueError('Set ADMIN_TOKEN to a random value of at least 32 characters before starting the server')
+
+    @property
+    def admin_token_is_secure(self) -> bool:
+        return len(self.admin_token.strip()) >= 32 and self.admin_token != 'change_me_admin_token'
 
     @property
     def allowed_models(self) -> list[str]:

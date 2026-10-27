@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +45,7 @@ class CodexAuthManager:
         return Path(settings.codex_login_log_file).expanduser()
 
     def codex_exists(self) -> bool:
-        return bool(subprocess.run(['bash', '-lc', f'command -v {settings.codex_command} >/dev/null 2>&1'], check=False).returncode == 0)
+        return shutil.which(settings.codex_command) is not None
 
     def start_login(self) -> dict[str, Any]:
         if self._proc and self._proc.poll() is None:
@@ -64,14 +66,10 @@ class CodexAuthManager:
             env['CODEX_AUTH_CREDENTIALS_STORE'] = settings.codex_auth_credentials_store
 
         cmd = settings.codex_login_command or f"{settings.codex_command} login"
-        log_fp = self.login_log_file.open('a', encoding='utf-8')
-        self._proc = subprocess.Popen(
-            ['bash', '-lc', cmd],
-            stdout=log_fp,
-            stderr=subprocess.STDOUT,
-            env=env,
-            text=True,
-        )
+        with self.login_log_file.open('a', encoding='utf-8') as log_fp:
+            self._proc = subprocess.Popen(
+                shlex.split(cmd), stdout=log_fp, stderr=subprocess.STDOUT, env=env, text=True,
+            )
         return {
             'started': True,
             'running': True,
@@ -157,26 +155,15 @@ PREFERRED_KEYS = {
 
 
 def extract_best_credential(obj: Any) -> CredentialCandidate | None:
-    best: CredentialCandidate | None = None
-    for path, value in _iter_values(obj):
-        if not isinstance(value, str) or not value.strip():
-            continue
-        key_name = path.split('.')[-1].replace(']','').replace('[','')
-        stripped = value.strip()
-        kind = None
-        if API_KEY_RE.search(stripped):
-            kind = 'api_key'
-        elif JWT_RE.match(stripped):
-            kind = 'jwt'
-        elif key_name in PREFERRED_KEYS and len(stripped) > 20:
-            kind = 'token'
-        if kind:
-            cand = CredentialCandidate(kind=kind, value=stripped, path=path)
-            if best is None:
-                best = cand
-            elif best.kind != 'api_key' and cand.kind == 'api_key':
-                best = cand
-    return best
+    # Only access/bearer tokens can authenticate the Codex backend. Never
+    # select an ID token, refresh token, or unrelated JWT by dictionary order.
+    values = list(_iter_values(obj))
+    for name in ('access_token', 'bearer_token', 'token'):
+        for path, value in values:
+            if path.split('.')[-1].lower() == name and isinstance(value, str) and value.strip():
+                return CredentialCandidate(kind='token', value=value.strip(), path=path)
+    return None
+
 
 
 codex_auth_manager = CodexAuthManager()

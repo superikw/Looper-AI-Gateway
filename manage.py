@@ -15,6 +15,7 @@ from app.config import settings
 from app.db import AsyncSessionLocal, Base, engine
 from app.models import ApiKey, OAuthSession, UpstreamCredential, User
 from app.migrations import initialize_database
+from app.http_client import close_http_client
 from app.oauth_manual import complete_oauth_session, start_oauth_session
 from app.utils import make_api_key, mask_key, sha256_text
 
@@ -44,7 +45,7 @@ async def cmd_doctor(_: argparse.Namespace) -> None:
         'database_url': settings.database_url,
         'upstream_base_url': settings.upstream_base_url,
         'upstream_auth_mode': settings.upstream_auth_mode,
-        'admin_token_configured': bool(settings.admin_token and settings.admin_token != 'change_me_admin_token'),
+        'admin_token_configured': settings.admin_token_is_secure,
         'oauth': {
             'authorize_url_configured': bool(settings.oauth_authorize_url),
             'token_url_configured': bool(settings.oauth_token_url),
@@ -317,7 +318,11 @@ def build_parser() -> argparse.ArgumentParser:
 async def amain() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    await args.func(args)
+    try:
+        await args.func(args)
+    finally:
+        await close_http_client()
+        await engine.dispose()
 
 
 if __name__ == '__main__':

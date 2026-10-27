@@ -6,6 +6,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+from app.crypto import EncryptedText
 
 
 class User(Base):
@@ -64,7 +65,7 @@ class OAuthSession(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     provider: Mapped[str] = mapped_column(String(32), index=True)
     state: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    code_verifier: Mapped[str] = mapped_column(Text)
+    code_verifier: Mapped[str] = mapped_column(EncryptedText())
     authorize_url: Mapped[str] = mapped_column(Text)
     callback_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default='pending', index=True)
@@ -79,12 +80,12 @@ class UpstreamCredential(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     provider: Mapped[str] = mapped_column(String(32), index=True)
     auth_mode: Mapped[str] = mapped_column(String(32), default='oauth_manual')
-    access_token: Mapped[str] = mapped_column(Text)
-    refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    access_token: Mapped[str] = mapped_column(EncryptedText())
+    refresh_token: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     token_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     scope: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_json: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
