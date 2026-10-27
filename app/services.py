@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 import httpx
+from sqlalchemy import update
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -408,10 +409,12 @@ async def record_usage(
     completion_tokens = int(usage.get('completion_tokens') or usage.get('output_tokens') or 0)
     total_tokens = int(usage.get('total_tokens') or (prompt_tokens + completion_tokens))
 
-    api_key.request_count += 1
-    api_key.prompt_tokens += prompt_tokens
-    api_key.completion_tokens += completion_tokens
-    api_key.total_tokens += total_tokens
+    await db.execute(update(ApiKey).where(ApiKey.id == api_key.id).values(
+        request_count=ApiKey.request_count + 1,
+        prompt_tokens=ApiKey.prompt_tokens + prompt_tokens,
+        completion_tokens=ApiKey.completion_tokens + completion_tokens,
+        total_tokens=ApiKey.total_tokens + total_tokens,
+    ).execution_options(synchronize_session=False))
 
     error_message = None
     if status_code >= 400:

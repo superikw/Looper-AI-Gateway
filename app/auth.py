@@ -29,6 +29,6 @@ async def require_api_key(
     hashed = sha256_text(raw_key)
     result = await db.execute(select(ApiKey).where(ApiKey.key_hash == hashed))
     api_key = result.scalar_one_or_none()
-    if not api_key or not api_key.enabled:
+    if not api_key or not api_key.enabled or api_key.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='invalid or disabled api key')
     return api_key

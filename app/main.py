@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from app.codex_auth import codex_auth_manager
 from app.config import settings
 from app.db import Base, engine, get_db
 from app.models import ApiKey, OAuthSession, UpstreamCredential, User
+from app.migrations import initialize_database
 from app.oauth_manual import complete_oauth_session, start_oauth_session
 from app.oauth_schemas import OAuthCompleteRequest
 from app.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyOut, UserCreate, UserOut
@@ -26,8 +28,7 @@ from app.utils import make_api_key, mask_key, sha256_text
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path('data').mkdir(parents=True, exist_ok=True)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await initialize_database()
     yield
 
 
@@ -87,16 +88,17 @@ async def create_key(payload: ApiKeyCreate, db: AsyncSession = Depends(get_db)):
 
 @app.get('/admin/keys', response_model=list[ApiKeyOut], dependencies=[Depends(require_admin)])
 async def list_keys(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(ApiKey).order_by(ApiKey.id.asc()))
+    result = await db.execute(select(ApiKey).where(ApiKey.deleted_at.is_(None)).order_by(ApiKey.id.asc()))
     return list(result.scalars().all())
 
 
 @app.delete('/admin/keys/{key_id}', dependencies=[Depends(require_admin)])
 async def delete_key(key_id: int, db: AsyncSession = Depends(get_db)):
     entity = await db.get(ApiKey, key_id)
-    if not entity:
+    if not entity or entity.deleted_at is not None:
         raise HTTPException(status_code=404, detail='key not found')
-    await db.delete(entity)
+    entity.enabled = False
+    entity.deleted_at = datetime.utcnow()
     await db.commit()
     return {'ok': True, 'deleted': key_id}
 
@@ -104,7 +106,7 @@ async def delete_key(key_id: int, db: AsyncSession = Depends(get_db)):
 @app.post('/admin/keys/{key_id}/disable', dependencies=[Depends(require_admin)])
 async def disable_key(key_id: int, db: AsyncSession = Depends(get_db)):
     entity = await db.get(ApiKey, key_id)
-    if not entity:
+    if not entity or entity.deleted_at is not None:
         raise HTTPException(status_code=404, detail='key not found')
     entity.enabled = False
     await db.commit()
@@ -114,7 +116,7 @@ async def disable_key(key_id: int, db: AsyncSession = Depends(get_db)):
 @app.post('/admin/keys/{key_id}/enable', dependencies=[Depends(require_admin)])
 async def enable_key(key_id: int, db: AsyncSession = Depends(get_db)):
     entity = await db.get(ApiKey, key_id)
-    if not entity:
+    if not entity or entity.deleted_at is not None:
         raise HTTPException(status_code=404, detail='key not found')
     entity.enabled = True
     await db.commit()

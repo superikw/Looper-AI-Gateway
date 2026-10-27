@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import secrets
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from sqlalchemy import func, select
 from app.config import settings
 from app.db import AsyncSessionLocal, Base, engine
 from app.models import ApiKey, OAuthSession, UpstreamCredential, User
+from app.migrations import initialize_database
 from app.oauth_manual import complete_oauth_session, start_oauth_session
 from app.utils import make_api_key, mask_key, sha256_text
 
@@ -23,8 +25,7 @@ def print_json(data: Any) -> None:
 
 async def ensure_db() -> None:
     Path('data').mkdir(parents=True, exist_ok=True)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await initialize_database()
 
 
 async def cmd_generate_admin_token(_: argparse.Namespace) -> None:
@@ -185,7 +186,7 @@ async def cmd_create_key(args: argparse.Namespace) -> None:
 async def cmd_list_keys(_: argparse.Namespace) -> None:
     await ensure_db()
     async with AsyncSessionLocal() as db:
-        keys = (await db.execute(select(ApiKey).order_by(ApiKey.id.asc()))).scalars().all()
+        keys = (await db.execute(select(ApiKey).where(ApiKey.deleted_at.is_(None)).order_by(ApiKey.id.asc()))).scalars().all()
     print_json([
         {
             'id': k.id,
@@ -207,7 +208,7 @@ async def cmd_disable_key(args: argparse.Namespace) -> None:
     await ensure_db()
     async with AsyncSessionLocal() as db:
         entity = await db.get(ApiKey, args.key_id)
-        if not entity:
+        if not entity or entity.deleted_at is not None:
             raise SystemExit(f'key not found: {args.key_id}')
         entity.enabled = False
         await db.commit()
@@ -218,7 +219,7 @@ async def cmd_enable_key(args: argparse.Namespace) -> None:
     await ensure_db()
     async with AsyncSessionLocal() as db:
         entity = await db.get(ApiKey, args.key_id)
-        if not entity:
+        if not entity or entity.deleted_at is not None:
             raise SystemExit(f'key not found: {args.key_id}')
         entity.enabled = True
         await db.commit()
@@ -229,9 +230,10 @@ async def cmd_delete_key(args: argparse.Namespace) -> None:
     await ensure_db()
     async with AsyncSessionLocal() as db:
         entity = await db.get(ApiKey, args.key_id)
-        if not entity:
+        if not entity or entity.deleted_at is not None:
             raise SystemExit(f'key not found: {args.key_id}')
-        await db.delete(entity)
+        entity.enabled = False
+        entity.deleted_at = datetime.utcnow()
         await db.commit()
         print_json({'ok': True, 'deleted': args.key_id})
 
