@@ -51,11 +51,12 @@ WARP 只代理服务端出站流量，所有上游账号共享出口；浏览器
 
 ### 1. 检查服务器环境
 
-准备 Git、curl、Docker Engine 和 Compose 插件。Docker 安装请按服务器发行版使用官方步骤：[Ubuntu](https://docs.docker.com/engine/install/ubuntu/)、[Debian](https://docs.docker.com/engine/install/debian/)；已有 Docker 时可单独[安装 Compose 插件](https://docs.docker.com/compose/install/linux/)。宿主机无需安装 Python 或 Codex CLI。
+准备 Git、curl、OpenSSL、Docker Engine 和 Compose 插件。Docker 安装请按服务器发行版使用官方步骤：[Ubuntu](https://docs.docker.com/engine/install/ubuntu/)、[Debian](https://docs.docker.com/engine/install/debian/)；已有 Docker 时可单独[安装 Compose 插件](https://docs.docker.com/compose/install/linux/)。宿主机无需安装 Python 或 Codex CLI。
 
 ```bash
 git --version
 curl --version
+openssl version
 docker --version
 docker compose version
 docker info
@@ -86,9 +87,7 @@ cp .env.docker.example .env
 ### 3. 生成并填写管理员口令
 
 ```bash
-docker compose build looper-ai-gateway
-docker compose run --rm --no-deps looper-ai-gateway \
-  python manage.py generate-admin-token
+openssl rand -hex 32
 ```
 
 保存输出的随机口令，然后编辑配置：
@@ -106,13 +105,14 @@ WARP_IMAGE=caomingjun/warp:latest
 WARP_SLEEP=5
 ```
 
-管理员口令至少 32 个字符，未配置或长度不足时服务会拒绝启动。`--no-deps` 让生成口令时无需启动 WARP。其余配置可以保持示例默认值，Compose 会自动设置 `UPSTREAM_PROXY_URL=http://warp:1080`。
+上述命令在宿主机生成 64 个十六进制字符的随机口令，无需启动容器、数据库或 WARP。管理员口令至少 32 个字符，未配置或长度不足时服务会拒绝启动。其余配置可以保持示例默认值，Compose 会自动设置 `UPSTREAM_PROXY_URL=http://warp:1080`。
 
 `ADMIN_TOKEN` 用于管理接口；下游客户端使用第 6 步创建的 `gtw_...` Key。
 
 ### 4. 启动服务并验证 WARP
 
 ```bash
+docker compose build looper-ai-gateway
 docker compose up -d
 docker compose ps
 ```
@@ -250,21 +250,22 @@ ssh -N -L 34567:127.0.0.1:34567 用户名@服务器IP
 
 ### 使用 podman-compose
 
-`podman-compose` 与 Docker Compose 的参数支持随版本不同。例如 [podman-compose 1.0.6](https://github.com/containers/podman-compose/blob/v1.0.6/podman_compose.py) 的 `run` 不接受 `--build`。构建和启动分开执行即可避免依赖这一参数，`--build` 也不能放在子命令前面。
+`podman-compose` 与 Docker Compose 的参数及依赖处理随版本不同。例如 [podman-compose 1.0.6](https://github.com/containers/podman-compose/blob/v1.0.6/podman_compose.py) 的 `run` 不接受 `--build`，而且 `run --no-deps` 仍会给临时容器添加 `--requires`。如果 WARP 容器尚未创建，生成口令会因此失败。
+
+使用宿主机 OpenSSL 生成管理员口令，构建和启动分开执行，即可避开这两个问题。
 
 先按第 2 步下载项目、创建 `.env`，然后在项目目录执行：
 
 ```bash
 podman --version
 podman-compose version
-podman-compose build looper-ai-gateway
-podman-compose run --rm --no-deps looper-ai-gateway \
-  python manage.py generate-admin-token
+openssl rand -hex 32
 ```
 
 将生成的口令填入 `.env` 的 `ADMIN_TOKEN`，再启动：
 
 ```bash
+podman-compose build looper-ai-gateway
 podman-compose up -d
 podman-compose ps
 podman-compose logs --tail=100 warp looper-ai-gateway
@@ -520,6 +521,16 @@ docker compose down
 日志输出事件名、路径、模型、HTTP 状态和上游 request ID，不输出提示词、响应正文、账号 ID 或 token。迁移不会清理已有备份或旧版日志中的敏感内容。
 
 ## 常见问题
+
+### Podman 生成管理员口令时报 WARP 依赖不存在
+
+如果 `podman-compose run --no-deps` 仍生成 `--requires=looper-ai-gateway_warp_1`，并报 `no such container`，这是 1.0.6 的依赖处理行为。无需创建 WARP 容器来生成口令，直接在宿主机执行：
+
+```bash
+openssl rand -hex 32
+```
+
+将输出写入 `.env` 的 `ADMIN_TOKEN`，然后按前文构建并启动。`podman compose` 是调用外部 Compose provider 的入口；当它使用 `/usr/bin/podman-compose` 时，也受该 provider 版本行为影响。
 
 ### WARP 未就绪，Gateway 无法启动
 
