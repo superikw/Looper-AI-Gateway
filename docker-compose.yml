@@ -48,7 +48,7 @@ services:
     depends_on:
       - warp
     ports:
-      - "127.0.0.1:34567:8080"
+      - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${GATEWAY_HOST_PORT:-34567}:8080"
     volumes:
       - ./data:/app/data
       # Optional: only needed if you still want to support codex_auth_file mode

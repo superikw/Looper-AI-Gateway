@@ -476,7 +476,22 @@ curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
 
 Docker 镜像未安装 Codex CLI；如使用文件模式，需要挂载认证文件。如使用 CLI 登录管理接口，还需自行准备含 Codex CLI 的运行环境。
 
-`.env.docker.example` 用于 Docker 部署，`.env.example` 用于本地开发。Docker 中 `HOST=0.0.0.0`、容器内端口固定为 `8080`，宿主机端口在 `docker-compose.yml` 中配置。Compose 会覆盖 `.env` 中的 `PORT`，避免应用监听端口与健康检查、端口映射不一致；数据库与密钥文件路径也相对于容器内的 `/app`。
+`.env.docker.example` 用于 Docker 部署，`.env.example` 用于本地开发。Docker 中 `HOST=0.0.0.0`、容器内端口固定为 `8080`，宿主机绑定地址和端口由 `GATEWAY_BIND_ADDRESS`、`GATEWAY_HOST_PORT` 配置，默认只监听 `127.0.0.1:34567`。Compose 会覆盖 `.env` 中的 `PORT`，避免应用监听端口与健康检查、端口映射不一致；数据库与密钥文件路径也相对于容器内的 `/app`。
+
+需要让远程客户端访问时，在服务器 `.env` 设置：
+
+```env
+GATEWAY_BIND_ADDRESS=0.0.0.0
+GATEWAY_HOST_PORT=34567
+```
+
+然后重新创建 Gateway：
+
+```bash
+podman-compose up -d --force-recreate
+```
+
+同时在云平台安全组和服务器防火墙放行 TCP `34567`。公网暴露前应在反向代理或防火墙层限制来源；API Key 只作为应用鉴权，不会限制端口扫描或连接建立。
 
 修改 `.env` 后执行 `docker compose up -d` 让配置生效，单独执行 `docker compose restart` 不会重新加载容器环境变量。Compose 在 `environment` 中固定设置上游代理，修改 `.env` 中的 `UPSTREAM_PROXY_URL` 不会覆盖它。账号限额和模型黑名单保存在数据库中，通过管理命令或管理员接口修改即可，无需重启。
 
