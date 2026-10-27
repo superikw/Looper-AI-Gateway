@@ -14,6 +14,7 @@ Linux 部署统一使用 **WARP + Gateway**：一个 `docker-compose.yml` 启动
 - [部署](#部署)
 - [多账号池与固定绑定](#多账号池与固定绑定)
 - [用户与用量管理](#用户与用量管理)
+- [模型黑名单](#模型黑名单)
 - [配置说明](#配置说明)
 - [更新与备份](#更新与备份)
 - [常见问题](#常见问题)
@@ -25,9 +26,9 @@ Linux 部署统一使用 **WARP + Gateway**：一个 `docker-compose.yml` 启动
 | --- | --- |
 | `POST /v1/chat/completions` | 文本、用户图片、函数工具及工具结果、普通 JSON 和 SSE 流式输出 |
 | `POST /v1/responses` | Responses 输入、工具定义、普通 JSON 和具名 SSE 事件 |
-| `GET /v1/models` | 返回本地模型白名单；不代表上游实时可用模型 |
+| `GET /v1/models` | 返回本地展示目录并过滤黑名单；目录外的模型也可请求，不代表上游实时可用模型 |
 | `POST /v1/embeddings` | 明确返回 400，当前上游路线不支持 |
-| `/admin/*` | 用户、Key、上游账号池、OAuth 登录和用量管理 |
+| `/admin/*` | 用户、Key、上游账号池、模型黑名单、OAuth 登录和用量管理 |
 | `GET /healthz` | 进程存活检查 |
 | `GET /readyz` | 数据库和上游凭证就绪检查；必要时刷新凭证，不发起模型推理 |
 
@@ -199,7 +200,9 @@ docker compose exec looper-ai-gateway python manage.py create-key \
 
 ### 7. 在服务器验证 API 调用
 
-将示例中的 `你的gtw_key` 替换为刚生成的 Key。示例模型需要在 `DEFAULT_ALLOWED_MODELS` 中，且上游账号有使用权限；白名单不代表模型实时可用。
+将示例中的 `你的gtw_key` 替换为刚生成的 Key。网关默认允许所有模型，仅拦截数据库黑名单中的模型；上游账号仍需有使用权限。
+
+以下示例使用 `gpt-6.1-sol`。[OpenAI 官方说明](https://learn.chatgpt.com/docs/enterprise/workspace-model-availability#prepare-for-the-gpt-55-retirement)指出，`gpt-5.5` 已于 2026 年 10 月 14 日从 ChatGPT 登录的 Codex 中退役，API Key 认证不受该次退役影响。实际可用模型仍取决于登录账号和工作区权限。
 
 普通请求：
 
@@ -207,7 +210,7 @@ docker compose exec looper-ai-gateway python manage.py create-key \
 curl -sS http://127.0.0.1:34567/v1/chat/completions \
   -H 'Authorization: Bearer 你的gtw_key' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"gpt-6.1-sol","messages":[{"role":"user","content":"你好"}]}'
 ```
 
 流式请求：
@@ -216,7 +219,7 @@ curl -sS http://127.0.0.1:34567/v1/chat/completions \
 curl -N http://127.0.0.1:34567/v1/chat/completions \
   -H 'Authorization: Bearer 你的gtw_key' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"你好"}],"stream":true,"stream_options":{"include_usage":true}}'
+  -d '{"model":"gpt-6.1-sol","messages":[{"role":"user","content":"你好"}],"stream":true,"stream_options":{"include_usage":true}}'
 ```
 
 Responses 请求：
@@ -225,7 +228,7 @@ Responses 请求：
 curl -sS http://127.0.0.1:34567/v1/responses \
   -H 'Authorization: Bearer 你的gtw_key' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.5","input":"你好"}'
+  -d '{"model":"gpt-6.1-sol","input":"你好"}'
 ```
 
 ### 8. 从自己电脑访问
@@ -405,6 +408,45 @@ Key 明文仅在创建时返回，数据库保存 SHA-256 摘要。删除采用�
 
 管理员 HTTP 接口使用 `Authorization: Bearer <ADMIN_TOKEN>`。接口清单可在 `/docs` 查看；`manage.py` 直接访问数据库，不需要通过 HTTP 管理员鉴权。
 
+## 模型黑名单
+
+默认黑名单为空，所有模型名都允许转发，无需预先登记。黑名单对所有 Key、上游认证模式和账号生效，普通请求与流式请求使用相同检查。命中时返回 HTTP 403 和 `model blocked: <模型名>`，记录拒绝日志，不向上游发出请求。
+
+黑名单持久化在数据库中，可动态添加、查看和移除。提交后从下一次请求开始生效，无需重启；已经开始的请求继续执行。模型名按请求相同规则规范化后精确匹配，例如 `GPT6.1_sol` 和 `gpt-6.1-sol` 视为同一模型，不支持通配符。重复添加或移除均可安全执行。
+
+在服务器项目目录执行。以下为 Podman 命令，Docker 用户将 `podman-compose` 换成 `docker compose`：
+
+```bash
+# 添加黑名单
+podman-compose exec looper-ai-gateway python manage.py block-model gpt-6.1-sol
+
+# 查看黑名单
+podman-compose exec looper-ai-gateway python manage.py list-blocked-models
+
+# 从黑名单移除，恢复转发
+podman-compose exec looper-ai-gateway python manage.py unblock-model gpt-6.1-sol
+```
+
+也可以使用管理员接口：
+
+```bash
+curl -sS -X POST http://127.0.0.1:34567/admin/models/blacklist \
+  -H 'Authorization: Bearer 你的ADMIN_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-6.1-sol"}'
+
+curl -sS http://127.0.0.1:34567/admin/models/blacklist \
+  -H 'Authorization: Bearer 你的ADMIN_TOKEN'
+
+curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
+  -H 'Authorization: Bearer 你的ADMIN_TOKEN' \
+  --data-urlencode 'model=gpt-6.1-sol'
+```
+
+`MODEL_CATALOG` 仅配置 `GET /v1/models` 的展示列表，默认展示 `gpt-6.1-sol`，并自动过滤黑名单。目录之外的模型仍可直接请求；留空只会返回空目录，不会禁用模型。该目录不查询上游实时可用性。
+
+升级时自动创建空黑名单，原有用户、Key 和账号不变。旧的 `DEFAULT_ALLOWED_MODELS` 配置不再生效，可以从 `.env` 删除；如需保留客户端展示列表，改用 `MODEL_CATALOG`。原来未列入白名单的模型升级后默认放行，需要禁用的模型请主动加入黑名单。
+
 ## 配置说明
 
 | 配置 | 作用 |
@@ -424,11 +466,11 @@ Key 明文仅在创建时返回，数据库保存 SHA-256 摘要。删除采用�
 | `UPSTREAM_RATE_LIMIT_COOLDOWN_SECONDS` | 429 缺少有效 Retry-After 时的冷却秒数，默认 60 |
 | `UPSTREAM_CAPACITY_WAIT_SECONDS` | RPM、并发或最小间隔受限时最多等待的秒数，默认 15；设为 0 立即返回 429 |
 | `MAX_REQUEST_BYTES` | 请求体大小限制，默认 16777216 字节（16 MiB） |
-| `DEFAULT_ALLOWED_MODELS` | 全局模型白名单，留空表示不限制；模型名会规范化 |
+| `MODEL_CATALOG` | `/v1/models` 展示列表，默认 `gpt-6.1-sol`；不限制请求模型，留空返回空目录 |
 | `DEFAULT_INSTRUCTIONS` | 缺少指令时使用的默认提示 |
 | `OAUTH_*` | OAuth 地址、客户端标识、回调地址和 PKCE 会话配置 |
 
-模型白名单是访问策略，不能用来发现上游模型。项目没有自动选择“最新模型”的逻辑。
+模型访问策略由数据库黑名单控制，默认全部放行。项目没有自动发现或选择“最新模型”的逻辑。
 
 多账号池仅在 `oauth_manual` 模式启用，推荐使用此模式。文件和环境变量模式仍使用单个账号。`codex_auth_file` 从 `CODEX_HOME/auth.json` 读取 access token，文件模式不会自行刷新登录态，需要外部维护；`env_token` 需要设置 `UPSTREAM_BEARER_TOKEN`。所有模式都需要可解析的 ChatGPT account ID，不能用任意官方 API Key 代替。
 
@@ -436,7 +478,9 @@ Docker 镜像未安装 Codex CLI；如使用文件模式，需要挂载认证文
 
 `.env.docker.example` 用于 Docker 部署，`.env.example` 用于本地开发。Docker 中 `HOST=0.0.0.0`、`PORT=8080` 是容器内监听地址，宿主机端口在 `docker-compose.yml` 中配置。数据库与密钥文件路径也相对于容器内的 `/app`。
 
-修改 `.env` 后执行 `docker compose up -d` 让配置生效，单独执行 `docker compose restart` 不会重新加载容器环境变量。Compose 在 `environment` 中固定设置上游代理，修改 `.env` 中的 `UPSTREAM_PROXY_URL` 不会覆盖它。账号限额保存在数据库中，通过管理命令或管理员接口修改即可，无需重启。
+修改 `.env` 后执行 `docker compose up -d` 让配置生效，单独执行 `docker compose restart` 不会重新加载容器环境变量。Compose 在 `environment` 中固定设置上游代理，修改 `.env` 中的 `UPSTREAM_PROXY_URL` 不会覆盖它。账号限额和模型黑名单保存在数据库中，通过管理命令或管理员接口修改即可，无需重启。
+
+`podman-compose 1.0.6` 可能无法识别仅 `.env` 内容的变化；修改后执行 `podman-compose up -d --force-recreate`，重新创建容器并加载配置。该操作会短暂停止两个服务，保留宿主机数据目录。
 
 ## 更新与备份
 
@@ -445,7 +489,7 @@ Docker 镜像未安装 Codex CLI；如使用文件模式，需要挂载认证文
 | 宿主机路径 | 内容 |
 | --- | --- |
 | `.env` | 管理员口令、运行配置及可能配置的加密密钥 |
-| `data/gateway.db` | 用户、Key 摘要、账号凭证、限额与用量 |
+| `data/gateway.db` | 用户、Key 摘要、账号凭证、限额、模型黑名单与用量 |
 | `data/credential.key` | 默认 Fernet 密钥，首次使用自动生成 |
 | `data/` 下的其他文件 | SQLite 辅助文件和请求、刷新相关的锁文件 |
 | `warp-data/` | WARP 注册与运行数据 |
@@ -476,7 +520,7 @@ curl -f http://127.0.0.1:34567/readyz
 
 再执行一次实际 API 请求验证。更新时保留原 `.env` 和数据目录；新版本增加配置时参考 `.env.docker.example` 补充。之前使用双 Compose 文件的部署，更新后也统一使用单个 `docker-compose.yml`，按上述命令分步构建和启动。
 
-启动服务和执行数据库管理命令时会自动进行幂等迁移，包括旧凭证加密、软删除、账号池及限额字段。迁移按 schema 版本执行，密钥校验失败会回滚。不要把旧代码直接指向已升级数据库作为回滚方案；需要回滚时使用与备份兼容的代码和数据。
+启动服务和执行数据库管理命令时会自动进行幂等迁移，包括旧凭证加密、软删除、账号池及限额字段、模型黑名单表。迁移按 schema 版本执行，密钥校验失败会回滚。不要把旧代码直接指向已升级数据库作为回滚方案；需要回滚时使用与备份兼容的代码和数据。
 
 ### 恢复备份
 
@@ -525,6 +569,24 @@ docker compose down
 日志输出事件名、路径、模型、HTTP 状态和上游 request ID，不输出提示词、响应正文、账号 ID 或 token。迁移不会清理已有备份或旧版日志中的敏感内容。
 
 ## 常见问题
+
+### model blocked 与 model_not_found 有什么区别
+
+| 错误 | 来源 | 处理方式 |
+| --- | --- | --- |
+| `model blocked: gpt-6.1-sol` | 网关数据库黑名单 | 通过 `unblock-model` 或管理员接口移除，无需重启 |
+| 上游返回 `model_not_found` 或 `not supported when using Codex with a ChatGPT account` | 上游模型或账号权限 | 使用当前账号有权访问的模型；工作区账号还需管理员开放相应模型 |
+
+如果仍看到旧错误 `model not allowed`，说明容器还在运行白名单版本。更新并重建网关镜像：
+
+```bash
+git pull --ff-only
+podman-compose build looper-ai-gateway
+podman-compose up -d --force-recreate
+podman-compose exec looper-ai-gateway python manage.py list-blocked-models
+```
+
+首次升级黑名单应为空（`[]`），之后按第 7 步实际调用。网关放行仅允许转发，不授予上游访问权限；上游不支持或账号无权使用的模型仍会返回错误。
 
 ### Podman 报 sysctl 缺少 KEY=VALUE
 
