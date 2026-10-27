@@ -1,4 +1,5 @@
 """Authenticated encryption at the database boundary; key lives outside SQLite."""
+
 import fcntl
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ from sqlalchemy.types import TypeDecorator
 
 from app.config import settings
 
-PREFIX = 'fernet:v1:'
+PREFIX = "fernet:v1:"
 
 
 def cipher() -> Fernet:
@@ -18,7 +19,7 @@ def cipher() -> Fernet:
     path = Path(settings.credential_key_file).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(fd, 'r+b') as stream:
+    with os.fdopen(fd, "r+b") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         os.fchmod(stream.fileno(), 0o600)
         key = stream.read().strip()
@@ -40,9 +41,11 @@ def decrypt(value: str | None) -> str | None:
     if value is None or not value.startswith(PREFIX):
         return value  # Legacy rows are rewritten by initialize_database.
     try:
-        return cipher().decrypt(value[len(PREFIX):].encode()).decode()
+        return cipher().decrypt(value[len(PREFIX) :].encode()).decode()
     except InvalidToken:
-        raise ValueError('Cannot decrypt credentials; restore the original credential encryption key') from None
+        raise ValueError(
+            "Cannot decrypt credentials; restore the original credential encryption key"
+        ) from None
 
 
 class EncryptedText(TypeDecorator):

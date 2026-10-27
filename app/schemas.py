@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pydantic import BaseModel
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UserCreate(BaseModel):
-    name: str
-    note: str | None = None
+    name: str = Field(min_length=1, max_length=128)
+    note: str | None = Field(default=None, max_length=255)
 
 
 class UserOut(BaseModel):
@@ -15,13 +16,12 @@ class UserOut(BaseModel):
     note: str | None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ApiKeyCreate(BaseModel):
-    user_id: int
-    name: str
+    user_id: int = Field(gt=0)
+    name: str = Field(min_length=1, max_length=128)
 
 
 class ApiKeyCreated(BaseModel):
@@ -46,5 +46,4 @@ class ApiKeyOut(BaseModel):
     total_tokens: int
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

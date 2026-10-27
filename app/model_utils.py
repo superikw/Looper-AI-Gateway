@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import re
 
-
-GPT_COMPACT_RE = re.compile(r'^gpt[-_ ]?(\d+(?:\.\d+)?(?:-[a-z0-9]+)*)$', re.IGNORECASE)
+GPT_COMPACT_RE = re.compile(r"^gpt[-_ ]?(\d+(?:\.\d+)?(?:-[a-z0-9]+)*)$", re.IGNORECASE)
 
 
 def canonicalize_model_name(model: str | None) -> str | None:
@@ -14,10 +13,10 @@ def canonicalize_model_name(model: str | None) -> str | None:
     if not normalized:
         return None
 
-    normalized = normalized.replace('_', '-').replace(' ', '-')
+    normalized = normalized.replace("_", "-").replace(" ", "-")
     match = GPT_COMPACT_RE.fullmatch(normalized)
     if match:
-        return f'gpt-{match.group(1)}'
+        return f"gpt-{match.group(1)}"
     return normalized
 
 

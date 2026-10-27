@@ -2,361 +2,178 @@
 
 GitHub 仓库：https://github.com/superikw/Looper-AI-Gateway
 
-一个给 ChatGPT / Codex 登录态做二次分发的 Python Gateway。
+一个用 Python / FastAPI 实现的内部 AI 网关：管理员维护一份 ChatGPT / Codex 上游登录态，给下游用户分配独立 API Key，通过 OpenAI 风格接口转发请求并统计用量。
 
-它做的事情很简单：
+下游 Key 隔离访问权限和用量，上游账号与额度共享。适合内部工具和少量可信用户；当前没有账号池、按 Key 配额、分布式调度或管理 UI。
 
-- 你自己登录一次 Codex / ChatGPT
-- Gateway 保存这份上游登录态
-- 你创建多个下游用户和 API Key
-- 下游统一用 OpenAI 风格接口请求 Gateway
-- Gateway 再把请求转发到 ChatGPT Codex backend
+## 功能与兼容范围
 
-当前这版已经验证可用的主路径是：
+| 入口 | 支持范围 |
+| --- | --- |
+| `POST /v1/chat/completions` | 文本、用户图片、函数工具及工具结果、普通 JSON 和 SSE 流式输出 |
+| `POST /v1/responses` | Responses 输入、工具定义、普通 JSON 和具名 SSE 事件 |
+| `GET /v1/models` | 返回本地模型白名单；不代表上游实时可用模型 |
+| `POST /v1/embeddings` | 明确返回 400，当前上游路线不支持 |
+| `/admin/*` | 用户、Key、OAuth 登录和用量管理 |
+| `GET /healthz` | 进程存活检查 |
+| `GET /readyz` | 数据库和上游凭证就绪检查；必要时刷新凭证，不发起模型推理 |
 
-- 上游认证：OpenClaw 同款 OAuth
-- 上游请求层：`https://chatgpt.com/backend-api/codex/responses`
-- 下游入口：`/v1/chat/completions`
+Chat Completions 支持 `tools` / `tool_choice`、`parallel_tool_calls`、`temperature`、`reasoning` / `reasoning_effort`、`metadata`、`response_format`（text / json_object / json_schema）。`max_tokens`、`max_completion_tokens` 和 `max_output_tokens` 均映射为上游输出 token 上限，同一请求只能指定一个。
 
----
+`stream=true` 会增量输出文本、拒绝内容和函数参数。Chat Completions 以 `[DONE]` 结束，可通过 `stream_options.include_usage=true` 获取最终用量；Responses 保留具名事件格式。流式开始前发现错误会返回错误 HTTP 状态；开始后的错误通过 SSE 传递，并在用量日志中记录失败状态。
 
-## 1. 适用场景
+不支持的参数和内容类型会返回 400，不会静默丢弃。当前不支持多候选结果（`n > 1`）、音频和 `store=true`。缺少 system/developer 指令时自动补充 `DEFAULT_INSTRUCTIONS`。具体模型、参数和工具是否可用仍取决于上游账号与 Codex backend。
 
-适合：
+协议转换参考：[OpenAI Responses 迁移说明](https://developers.openai.com/api/docs/guides/migrate-to-responses)、[Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)。这些文档描述公开 API 格式，不保证 ChatGPT backend 的全部行为。
 
-- 你自己有 ChatGPT / Codex 账号
-- 你想给多个内部用户或脚本分发自己的 Gateway Key
-- 你希望把上游登录态和下游调用隔离开
-
-不适合：
-
-- 公网开放转售
-- 强 SLA 商用 API 平台
-- 需要完全兼容 OpenAI 官方全量 API 的场景
-
----
-
-## 2. 当前状态
-
-这版已经支持：
-
-- Codex OAuth 登录
-- 用户管理
-- API Key 创建 / 删除 / 启停
-- token usage 统计
-- `/v1/chat/completions`
-- `/v1/responses`
-- `/v1/models`
-- Docker / Docker Compose 部署
-- `manage.py` 本地管理命令
-- 默认自动补 `instructions`
-
-注意：
-
-- `embeddings` 目前不支持这条 Codex backend 路线
-- 最稳的模型是 Codex / GPT-5 系列，不是 `gpt-4o-mini`
-
----
-
-## 3. 项目结构
-
-```text
-Looper-AI-Gateway/
-├── app/
-├── .env.example
-├── .env.docker.example
-├── Dockerfile
-├── docker-compose.yml
-├── manage.py
-├── README.md
-└── requirements.txt
-```
-
----
-
-## 4. 最重要的配置
-
-推荐 `.env` 至少包含这些：
-
-```env
-ADMIN_TOKEN=自己生成的随机字符串
-
-UPSTREAM_BASE_URL=https://chatgpt.com/backend-api
-UPSTREAM_AUTH_MODE=oauth_manual
-UPSTREAM_OPENAI_BETA=responses=experimental
-DEFAULT_INSTRUCTIONS=You are a helpful assistant.
-DEFAULT_ALLOWED_MODELS=gpt-5.5,gpt-5.4,gpt-5.3,gpt-5.1-codex-mini,gpt-5.3-codex
-
-OAUTH_AUTHORIZE_URL=https://auth.openai.com/oauth/authorize
-OAUTH_TOKEN_URL=https://auth.openai.com/oauth/token
-OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
-OAUTH_REDIRECT_URI=http://localhost:1455/auth/callback
-OAUTH_SCOPE=openid profile email offline_access
-OAUTH_ORIGINATOR=pi
-OAUTH_CODEX_CLI_SIMPLIFIED_FLOW=true
-OAUTH_ID_TOKEN_ADD_ORGANIZATIONS=true
-```
-
-### `ADMIN_TOKEN` 是什么？
-
-它就是这个 Gateway 的管理员口令。
-
-不是平台发给你的，也不是 OpenAI 给的，是你自己写进 `.env` 的随机值。
-
-生成一个新的：
+## Docker Compose 启动
 
 ```bash
-python manage.py generate-admin-token
-```
-
----
-
-## 5. 启动
-
-### Docker Compose
-
-```bash
-cd /home/ubuntu/Looper-AI-Gateway
+git clone https://github.com/superikw/Looper-AI-Gateway.git
+cd Looper-AI-Gateway
 cp .env.docker.example .env
-# 按需修改 .env
-
-docker compose up -d --build
 ```
 
-### 查看状态
+先生成管理员口令：
 
 ```bash
-docker compose exec looper-ai-gateway python manage.py doctor
+docker compose run --rm --build looper-ai-gateway python manage.py generate-admin-token
 ```
 
-你应该能看到：
+把输出写入 `.env` 的 `ADMIN_TOKEN`，然后启动：
 
-- `upstream_base_url` 是 `https://chatgpt.com/backend-api`
-- `upstream_auth_mode` 是 `oauth_manual`
+```bash
+docker compose up -d --build
+docker compose exec looper-ai-gateway python manage.py doctor
+curl http://127.0.0.1:34567/healthz
+```
 
----
+管理员口令必须是至少 32 个字符的随机值。空值、过短口令和旧版默认口令会使服务拒绝启动；本地 CLI 生成口令不受此限制。
 
-## 6. 登录 Codex / ChatGPT
+默认映射为 `127.0.0.1:34567:8080`：宿主机访问 **34567**，容器内服务监听 **8080**。如需其他机器直接访问，按部署需要修改绑定地址；也可以在宿主机配置反向代理。
 
-### 第一步：发起登录
+Compose 健康检查使用 `/healthz`，因此首次登录之前容器也可以正常启动。`/readyz` 在未登录或凭证不可用时返回 503；返回 200 也不代表已验证模型推理或上游剩余额度。
+
+## 本地运行
+
+需要 Python 3.12 或更新版本。进程间锁使用 POSIX 文件锁，支持 Linux/macOS；Windows 请使用 Docker。
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python manage.py generate-admin-token
+# 将生成的口令写入 .env
+python -m app.main
+```
+
+本地默认地址为 `http://127.0.0.1:8080`。
+
+## 重要配置
+
+| 配置 | 作用 |
+| --- | --- |
+| `ADMIN_TOKEN` | 管理员口令，无可用默认值 |
+| `DATABASE_URL` | 默认 `sqlite+aiosqlite:///./data/gateway.db` |
+| `CREDENTIAL_KEY_FILE` | 默认 `./data/credential.key`，首次使用自动生成，文件权限为 0600 |
+| `CREDENTIAL_ENCRYPTION_KEY` | 可选 Fernet 密钥；设置后优先于密钥文件，升级时必须保持一致 |
+| `UPSTREAM_BASE_URL` | 默认 `https://chatgpt.com/backend-api` |
+| `UPSTREAM_AUTH_MODE` | `oauth_manual`、`codex_auth_file` 或 `env_token` |
+| `UPSTREAM_TIMEOUT_SECONDS` | 上游 HTTP 超时，默认 120 秒 |
+| `MAX_REQUEST_BYTES` | 请求体大小限制，默认 16777216 字节（16 MiB） |
+| `DEFAULT_ALLOWED_MODELS` | 全局模型白名单，留空表示不限制；模型名会规范化 |
+| `DEFAULT_INSTRUCTIONS` | 缺少指令时使用的默认提示 |
+| `OAUTH_*` | OAuth 地址、客户端标识、回调地址和 PKCE 会话配置 |
+
+模型白名单是访问策略，不能用来发现上游模型。项目没有自动选择“最新模型”的逻辑。
+
+推荐使用 `oauth_manual`。`codex_auth_file` 从 `CODEX_HOME/auth.json` 读取 access token，文件模式不会自行刷新登录态，需要外部维护；`env_token` 需要设置 `UPSTREAM_BEARER_TOKEN`。所有模式都需要可解析的 ChatGPT account ID，不能用任意官方 API Key 代替。
+
+Docker 镜像未安装 Codex CLI；如使用文件模式，需要挂载认证文件。如使用 CLI 登录管理接口，还需自行准备含 Codex CLI 的运行环境。
+
+## 登录上游
 
 ```bash
 docker compose exec looper-ai-gateway python manage.py auth-start
 ```
 
-会返回：
-
-- `session_id`
-- `auth_url`
-- `state`
-
-### 第二步：浏览器打开 `auth_url`
-
-你自己完成登录。
-
-### 第三步：复制最终回调 URL
-
-浏览器最终会跳到类似：
-
-```text
-http://localhost:1455/auth/callback?code=...&state=...
-```
-
-### 第四步：完成登录
+在浏览器中打开输出的 `auth_url`，完成登录，复制最终回调 URL，然后执行：
 
 ```bash
 docker compose exec looper-ai-gateway python manage.py auth-complete \
   --session-id 1 \
-  --callback-url "http://localhost:1455/auth/callback?code=...&state=..."
-```
-
-### 第五步：检查登录状态
-
-```bash
+  --callback-url 'http://localhost:1455/auth/callback?code=...&state=...'
 docker compose exec looper-ai-gateway python manage.py auth-status
+curl http://127.0.0.1:34567/readyz
 ```
 
-如果成功，会看到当前 `credential` 和 `account_id`。
+这是手动回调流程，不需要 Gateway 监听 1455 端口。授权会话会校验 state 和过期时间，完成后清除 verifier，并仅保存回调已接收的标记。
 
----
+OAuth 凭证在到期前 90 秒触发刷新。同一台主机、共享数据库和相同密钥目录的进程会协调刷新，避免重复使用轮换中的 refresh token。锁和 SQLite 不用于跨主机部署。
 
-## 7. 创建用户和 API Key
-
-### 创建用户
+## 用户、Key 与用量
 
 ```bash
-docker compose exec looper-ai-gateway python manage.py create-user alice --note "team-a"
-```
-
-### 查看用户
-
-```bash
-docker compose exec looper-ai-gateway python manage.py list-users
-```
-
-### 创建 API Key
-
-```bash
+docker compose exec looper-ai-gateway python manage.py create-user alice --note 'team-a'
 docker compose exec looper-ai-gateway python manage.py create-key --user-id 1 --name alice-dev
-```
-
-输出里的 `api_key` 明文只会显示一次，记得自己保存。
-
-### 查看 API Key
-
-```bash
+docker compose exec looper-ai-gateway python manage.py list-users
 docker compose exec looper-ai-gateway python manage.py list-keys
+docker compose exec looper-ai-gateway python manage.py disable-key 1
+docker compose exec looper-ai-gateway python manage.py enable-key 1
+docker compose exec looper-ai-gateway python manage.py delete-key 1
+docker compose exec looper-ai-gateway python manage.py usage
 ```
 
----
+Key 明文仅在创建时返回，数据库保存 SHA-256 摘要。删除采用软删除：撤销访问、从 Key 列表隐藏并禁止重新启用，保留历史用量。用量汇总包含已删除 Key，计数使用数据库原子累加。
 
-## 8. 如何调用模型
+通过鉴权后的请求，包括参数错误和上游错误，都会计入请求次数。流式取消记录为 499；上游未返回的 token 用量无法精确补算。统计用于使用情况追踪，不是账单结算系统。
 
-### 推荐测试命令
+管理员 HTTP 接口使用 `Authorization: Bearer <ADMIN_TOKEN>`。接口清单可在 `/docs` 查看；`manage.py` 直接访问数据库，不需要通过 HTTP 管理员鉴权。
+
+## 调用示例
+
+普通文本请求：
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl http://127.0.0.1:34567/v1/chat/completions \
   -H 'Authorization: Bearer 你的gtw_key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-### 说明
-
-- 现在 Gateway 会在你**没有提供 system/developer 消息时**，自动补：
-
-```text
-You are a helpful assistant.
-```
-
-所以正常情况下，你不需要再每次手动写：
-
-```json
-{"role":"system","content":"You are a helpful assistant."}
-```
-
-### 当前推荐模型
-
-优先试这些：
-
-- `gpt-5.5`
-- `gpt-5.4`
-- `gpt-5.3`
-- `gpt-5.1-codex-mini`
-- `gpt-5.3-codex`
-
-不建议先测：
-
-- `gpt-4o-mini`
-
-因为 ChatGPT Codex backend 已经明确返回过：
-
-> The 'gpt-4o-mini' model is not supported when using Codex with a ChatGPT account.
-
----
-
-## 9. 管理命令
-
-最常用的是这些：
+流式请求：
 
 ```bash
-docker compose exec looper-ai-gateway python manage.py doctor
-docker compose exec looper-ai-gateway python manage.py auth-start
-docker compose exec looper-ai-gateway python manage.py auth-complete --session-id 1 --callback-url "..."
-docker compose exec looper-ai-gateway python manage.py auth-status
-docker compose exec looper-ai-gateway python manage.py create-user alice --note "team-a"
-docker compose exec looper-ai-gateway python manage.py list-users
-docker compose exec looper-ai-gateway python manage.py create-key --user-id 1 --name alice-dev
-docker compose exec looper-ai-gateway python manage.py list-keys
-docker compose exec looper-ai-gateway python manage.py usage
+curl -N http://127.0.0.1:34567/v1/chat/completions \
+  -H 'Authorization: Bearer 你的gtw_key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true}}'
 ```
 
----
+如上游不支持示例模型，请同时调整请求模型与 `DEFAULT_ALLOWED_MODELS`。普通接口失败返回 `error` 对象；超时返回 504，连接失败、畸形数据和缺少终止事件返回 502，上游 HTTP 错误通常保留其状态码。
 
-## 10. 查看用量统计
+## 升级、存储与日志
 
-```bash
-docker compose exec looper-ai-gateway python manage.py usage
-```
+启动服务和执行数据库管理命令时，会自动执行幂等迁移并记录 schema 版本：添加软删除字段，把旧版上游凭证和 OAuth verifier 转为加密值。升级前先备份数据库。
 
-可以看到每个 key 的：
+上游 access token、refresh token、原始 token JSON 和 PKCE verifier 使用 Fernet 加密。**备份和恢复必须同时保留数据库与原始密钥**；使用环境变量提供密钥时也必须保留该值。更改或丢失密钥后不能解密既有凭证，服务会在迁移检查时拒绝启动。
 
-- request_count
-- prompt_tokens
-- completion_tokens
-- total_tokens
-
----
-
-## 11. 看日志
+Compose 将 `./data` 持久化到 `/app/data`，默认密钥文件也在其中。迁移不会清理已有备份或旧版容器日志中的敏感内容。
 
 ```bash
 docker compose logs --tail=200 looper-ai-gateway
 ```
 
-当前日志里会包含：
+新日志只输出事件名、路径、模型、HTTP 状态和上游 request ID，不输出提示词、响应正文、账号 ID 或 token。HTTP 客户端使用连接池并在服务退出时关闭。
 
-- `upstream_request`
-- `upstream_response`
-
-用于排查上游 Codex backend 返回了什么。
-
----
-
-## 12. 常见问题
-
-### Q1：`model not allowed`
-说明你请求的模型不在 `.env` 的：
-
-```env
-DEFAULT_ALLOWED_MODELS=...
-```
-
-里。
-
-改 `.env` 后重启容器即可。
-
-### Q2：`Instructions are required`
-旧版本里，如果没有 system/developer 消息会触发这个问题。
-
-现在这版已经会自动补默认 instructions。重建容器后通常不需要你手工加 system message 了。
-
-### Q3：返回空内容
-这通常是上游返回结构和当前提取逻辑还存在边角兼容差异。
-
-先看：
+## 开发与验证
 
 ```bash
-docker compose logs --tail=200 looper-ai-gateway
+pip install -r requirements-dev.txt
+python -m pytest -q
+ruff check app manage.py tests
+ruff format --check app manage.py tests
 ```
 
-里的 `upstream_response`。
-
-### Q4：`gpt-4o-mini` 报不支持
-这是上游 Codex backend 的限制，不是你本地 Gateway 的 bug。
-
-### Q5：我平时还需要关心 `ADMIN_TOKEN` 吗？
-如果你主要通过 `manage.py` 管理，其实平时基本不用碰它。
-
-但 HTTP 管理接口还是依赖它做管理员鉴权，所以服务配置里仍然应该保留。
-
----
-
-## 13. 当前已知限制
-
-- `embeddings` 还没做这条 Codex backend 路线的适配
-- 响应内容提取还在继续打磨，个别请求可能成功但文本为空
-- 目前更偏内部自用版，不是强商用版
-- 管理后台 UI 还没做
-
----
-
-## 14. 建议的下一步
-
-如果你要继续把它打磨成更顺手的工具，下一步最值得做的是：
-
-1. 管理后台 Web UI
-2. 更完整的 Codex response 内容提取
-3. SSE 流式下游输出
-4. 上游凭证加密存储
-5. per-key 配额 / 限流
+测试使用临时 SQLite 数据库和模拟上游，不读取真实登录态，也不产生模型调用。覆盖错误状态、并发统计、Key 删除、凭证加密、旧数据迁移、跨进程刷新、工具与图片转换、SSE 拆包、流式取消和就绪检查。GitHub Actions 在 Python 3.12/3.13 上执行测试和静态检查。

@@ -5,14 +5,14 @@ from pathlib import Path
 import httpx
 import pytest_asyncio
 
-_temp = tempfile.TemporaryDirectory(prefix='looper-tests-')
-os.environ['DATABASE_URL'] = 'sqlite+aiosqlite:///' + str(Path(_temp.name) / 'test.db')
-os.environ['ADMIN_TOKEN'] = 'test-admin-token-with-enough-entropy'
-os.environ['CREDENTIAL_KEY_FILE'] = str(Path(_temp.name) / 'credential.key')
+_temp = tempfile.TemporaryDirectory(prefix="looper-tests-")
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///" + str(Path(_temp.name) / "test.db")
+os.environ["ADMIN_TOKEN"] = "test-admin-token-with-enough-entropy"
+os.environ["CREDENTIAL_KEY_FILE"] = str(Path(_temp.name) / "credential.key")
 
+from app.db import AsyncSessionLocal, Base, engine
 from app.main import app
-from app.db import Base, engine, AsyncSessionLocal
-from app.models import User, ApiKey
+from app.models import ApiKey, User
 from app.utils import sha256_text
 
 
@@ -27,17 +27,25 @@ async def database():
 
 @pytest_asyncio.fixture
 async def client():
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url='http://test') as client:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
         yield client
 
 
 @pytest_asyncio.fixture
 async def key():
     async with AsyncSessionLocal() as db:
-        user = User(name='test-user')
+        user = User(name="test-user")
         db.add(user)
         await db.flush()
-        key = ApiKey(user_id=user.id, name='test-key', key_hash=sha256_text('gtw_test'), key_preview='gtw_...test')
+        key = ApiKey(
+            user_id=user.id,
+            name="test-key",
+            key_hash=sha256_text("gtw_test"),
+            key_preview="gtw_...test",
+        )
         db.add(key)
         await db.commit()
         return key

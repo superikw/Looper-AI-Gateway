@@ -3,15 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from app.config import settings
-
 
 API_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]+\b")
 JWT_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
@@ -38,7 +37,7 @@ class CodexAuthManager:
 
     @property
     def auth_file(self) -> Path:
-        return self.codex_home / 'auth.json'
+        return self.codex_home / "auth.json"
 
     @property
     def login_log_file(self) -> Path:
@@ -50,33 +49,37 @@ class CodexAuthManager:
     def start_login(self) -> dict[str, Any]:
         if self._proc and self._proc.poll() is None:
             return {
-                'started': False,
-                'running': True,
-                'pid': self._proc.pid,
-                'message': 'login process already running',
-                'log_file': str(self.login_log_file),
+                "started": False,
+                "running": True,
+                "pid": self._proc.pid,
+                "message": "login process already running",
+                "log_file": str(self.login_log_file),
             }
 
         self.codex_home.mkdir(parents=True, exist_ok=True)
         self.login_log_file.parent.mkdir(parents=True, exist_ok=True)
 
         env = os.environ.copy()
-        env['CODEX_HOME'] = str(self.codex_home)
+        env["CODEX_HOME"] = str(self.codex_home)
         if settings.codex_auth_credentials_store:
-            env['CODEX_AUTH_CREDENTIALS_STORE'] = settings.codex_auth_credentials_store
+            env["CODEX_AUTH_CREDENTIALS_STORE"] = settings.codex_auth_credentials_store
 
         cmd = settings.codex_login_command or f"{settings.codex_command} login"
-        with self.login_log_file.open('a', encoding='utf-8') as log_fp:
+        with self.login_log_file.open("a", encoding="utf-8") as log_fp:
             self._proc = subprocess.Popen(
-                shlex.split(cmd), stdout=log_fp, stderr=subprocess.STDOUT, env=env, text=True,
+                shlex.split(cmd),
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
             )
         return {
-            'started': True,
-            'running': True,
-            'pid': self._proc.pid,
-            'command': cmd,
-            'log_file': str(self.login_log_file),
-            'auth_file': str(self.auth_file),
+            "started": True,
+            "running": True,
+            "pid": self._proc.pid,
+            "command": cmd,
+            "log_file": str(self.login_log_file),
+            "auth_file": str(self.auth_file),
         }
 
     def login_status(self) -> dict[str, Any]:
@@ -84,73 +87,79 @@ class CodexAuthManager:
         exit_code = None if running or not self._proc else self._proc.poll()
         auth_state = self.read_auth_state(safe=True)
         return {
-            'codex_exists': self.codex_exists(),
-            'running': running,
-            'pid': self._proc.pid if self._proc else None,
-            'exit_code': exit_code,
-            'auth_file': str(self.auth_file),
-            'log_file': str(self.login_log_file),
-            'auth_state': auth_state,
+            "codex_exists": self.codex_exists(),
+            "running": running,
+            "pid": self._proc.pid if self._proc else None,
+            "exit_code": exit_code,
+            "auth_file": str(self.auth_file),
+            "log_file": str(self.login_log_file),
+            "auth_state": auth_state,
         }
 
     def read_auth_state(self, safe: bool = True) -> dict[str, Any]:
         path = self.auth_file
         if not path.exists():
             return {
-                'exists': False,
-                'credential_found': False,
+                "exists": False,
+                "credential_found": False,
             }
         try:
-            obj = json.loads(path.read_text(encoding='utf-8'))
+            obj = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
             return {
-                'exists': True,
-                'credential_found': False,
-                'parse_error': str(e),
+                "exists": True,
+                "credential_found": False,
+                "parse_error": str(e),
             }
 
         candidate = extract_best_credential(obj)
         preview = None
         if candidate and safe:
             val = candidate.value
-            preview = f"{val[:8]}...{val[-4:]}" if len(val) > 16 else '***'
+            preview = f"{val[:8]}...{val[-4:]}" if len(val) > 16 else "***"
         return {
-            'exists': True,
-            'credential_found': candidate is not None,
-            'credential_kind': candidate.kind if candidate else None,
-            'credential_path': candidate.path if candidate else None,
-            'credential_preview': preview,
-            'top_level_keys': list(obj.keys()) if isinstance(obj, dict) else None,
+            "exists": True,
+            "credential_found": candidate is not None,
+            "credential_kind": candidate.kind if candidate else None,
+            "credential_path": candidate.path if candidate else None,
+            "credential_preview": preview,
+            "top_level_keys": list(obj.keys()) if isinstance(obj, dict) else None,
         }
 
     def load_bearer_token(self) -> str:
         path = self.auth_file
         if not path.exists():
-            raise CodexAuthError(f'codex auth file not found: {path}')
+            raise CodexAuthError(f"codex auth file not found: {path}")
         try:
-            obj = json.loads(path.read_text(encoding='utf-8'))
+            obj = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
-            raise CodexAuthError(f'failed to parse auth file: {e}') from e
+            raise CodexAuthError(f"failed to parse auth file: {e}") from e
 
         candidate = extract_best_credential(obj)
         if not candidate:
-            raise CodexAuthError('no usable token found in codex auth file')
+            raise CodexAuthError("no usable token found in codex auth file")
         return candidate.value
 
 
-def _iter_values(node: Any, prefix: str = '$'):
+def _iter_values(node: Any, prefix: str = "$"):
     if isinstance(node, dict):
         for key, value in node.items():
-            yield from _iter_values(value, f'{prefix}.{key}')
+            yield from _iter_values(value, f"{prefix}.{key}")
     elif isinstance(node, list):
         for idx, value in enumerate(node):
-            yield from _iter_values(value, f'{prefix}[{idx}]')
+            yield from _iter_values(value, f"{prefix}[{idx}]")
     else:
         yield prefix, node
 
 
 PREFERRED_KEYS = {
-    'api_key', 'apikey', 'openai_api_key', 'token', 'access_token', 'id_token', 'bearer_token'
+    "api_key",
+    "apikey",
+    "openai_api_key",
+    "token",
+    "access_token",
+    "id_token",
+    "bearer_token",
 }
 
 
@@ -158,12 +167,15 @@ def extract_best_credential(obj: Any) -> CredentialCandidate | None:
     # Only access/bearer tokens can authenticate the Codex backend. Never
     # select an ID token, refresh token, or unrelated JWT by dictionary order.
     values = list(_iter_values(obj))
-    for name in ('access_token', 'bearer_token', 'token'):
+    for name in ("access_token", "bearer_token", "token"):
         for path, value in values:
-            if path.split('.')[-1].lower() == name and isinstance(value, str) and value.strip():
-                return CredentialCandidate(kind='token', value=value.strip(), path=path)
+            if (
+                path.split(".")[-1].lower() == name
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                return CredentialCandidate(kind="token", value=value.strip(), path=path)
     return None
-
 
 
 codex_auth_manager = CodexAuthManager()
