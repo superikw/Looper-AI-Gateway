@@ -359,7 +359,8 @@ async def read_upstream_data(response: httpx.Response) -> dict:
         raise network_error(exc) from None
     if response.status_code < 400:
         raw_text = response.content.decode("utf-8", errors="replace")
-        if raw_text.lstrip().startswith("data:"):
+        has_sse_data = raw_text.lstrip().startswith("data:") or "\ndata:" in raw_text
+        if has_sse_data:
             return extract_sse_json(raw_text)
     try:
         data = response.json(parse_constant=reject_constant)
@@ -367,7 +368,7 @@ async def read_upstream_data(response: httpx.Response) -> dict:
         content_type = response.headers.get("content-type", "unknown")
         raise HTTPException(
             502,
-            f"upstream returned a non-JSON response (status={response.status_code}, content_type={content_type})",
+            f"upstream returned a non-JSON response (status={response.status_code}, content_type={content_type}, body_length={len(response.content)})",
         ) from None
     if not isinstance(data, dict):
         raise HTTPException(502, "upstream returned a non-object response")
