@@ -40,6 +40,9 @@ services:
       HTTP_PROXY: http://warp:1080
       HTTPS_PROXY: http://warp:1080
       NO_PROXY: localhost,127.0.0.1,::1
+      # The healthcheck and port mapping target the fixed container port.
+      # Set the host port in the ports mapping instead of changing PORT here.
+      PORT: "8080"
     # Do not gate Gateway creation on WARP health. podman-compose can wait
     # indefinitely during first-run WARP registration or TUN initialization.
     depends_on:
