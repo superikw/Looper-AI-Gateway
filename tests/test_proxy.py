@@ -594,14 +594,56 @@ async def test_initial_stream_failure_returns_error_http_status(client, key, ups
     assert "error" in response.json()
 
 
-async def test_embeddings_rejected_before_authenticating_upstream(client, key):
+async def test_embeddings_are_forwarded_by_generic_v1_proxy(client, key, upstream):
+    upstream.update(content_type="application/json", body=json.dumps({"data": []}))
     response = await client.post(
         "/v1/embeddings",
         headers=AUTH,
         json={"model": "text-embedding-3-small", "input": "hello"},
     )
-    assert response.status_code == 400
-    assert "not supported" in response.json()["error"]["message"]
+    assert response.status_code == 200
+    assert response.json() == {"data": []}
+    assert str(upstream["requests"][-1].url) == "https://chatgpt.com/backend-api/codex/embeddings"
+
+
+async def test_image_generation_uses_images_endpoint_and_preserves_response(
+    client, key, upstream
+):
+    upstream.update(
+        content_type="application/json",
+        body=json.dumps({"created": 1, "data": [{"b64_json": "aGVsbG8="}]}),
+    )
+    payload = {
+        "model": "image2",
+        "prompt": "a small blue bird",
+        "size": "1024x1024",
+        "quality": "high",
+    }
+    response = await client.post(
+        "/v1/images/generations", headers=AUTH, json=payload
+    )
+    assert response.status_code == 200
+    assert response.json()["data"][0]["b64_json"] == "aGVsbG8="
+    request = upstream["requests"][-1]
+    assert str(request.url) == "https://chatgpt.com/backend-api/codex/images/generations"
+    assert json.loads(request.content) == payload
+
+
+async def test_unknown_v1_route_is_authenticated_and_forwarded_verbatim(
+    client, key, upstream
+):
+    upstream.update(
+        content_type="application/json",
+        body=json.dumps({"ok": True}),
+    )
+    response = await client.post(
+        "/v1/files?purpose=test", headers=AUTH, content=b"raw-body"
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    request = upstream["requests"][-1]
+    assert str(request.url) == "https://chatgpt.com/backend-api/codex/files?purpose=test"
+    assert request.content == b"raw-body"
 
 
 async def test_stream_recovers_final_text_and_tool_argument_suffixes(

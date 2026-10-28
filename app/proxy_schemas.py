@@ -166,10 +166,26 @@ class ResponsesRequest(BaseProxyRequest):
         return self
 
 
+class ImageGenerationRequest(StrictModel):
+    model: str = Field(min_length=1, strict=True)
+    prompt: str = Field(min_length=1)
+    n: int | None = Field(default=None, gt=0, strict=True)
+    size: str | None = Field(default=None, min_length=1)
+    quality: str | None = Field(default=None, min_length=1)
+    background: str | None = Field(default=None, min_length=1)
+
+
+class ImageEditRequest(ImageGenerationRequest):
+    image: Any
+
+
 def validate_proxy_payload(path: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if path == "/v1/embeddings":
-        raise HTTPException(400, "embeddings are not supported in codex backend mode")
-    schema = ChatRequest if path == "/v1/chat/completions" else ResponsesRequest
+    if path == "/v1/images/generations":
+        schema = ImageGenerationRequest
+    elif path == "/v1/images/edits":
+        schema = ImageEditRequest
+    else:
+        schema = ChatRequest if path == "/v1/chat/completions" else ResponsesRequest
     try:
         return schema.model_validate(payload).model_dump(exclude_none=True)
     except ValidationError as exc:

@@ -27,12 +27,16 @@ Linux 部署统一使用 **WARP + Gateway**：一个 `docker-compose.yml` 启动
 | `POST /v1/chat/completions` | 文本、用户图片、函数工具及工具结果、普通 JSON 和 SSE 流式输出 |
 | `POST /v1/responses` | Responses 输入、工具定义、普通 JSON 和具名 SSE 事件 |
 | `GET /v1/models` | 返回本地展示目录并过滤黑名单；目录外的模型也可请求，不代表上游实时可用模型 |
-| `POST /v1/embeddings` | 明确返回 400，当前上游路线不支持 |
+| `POST /v1/images/generations` | 图像生成，透传到 Codex Images API |
+| `POST /v1/images/edits` | 图像编辑，原始请求透传到 Codex Images API |
+| `/v1/*` 其他路由 | API Key 鉴权后按原始方法、请求体和查询参数透传 |
 | `/admin/*` | 用户、Key、上游账号池、模型黑名单、OAuth 登录和用量管理 |
 | `GET /healthz` | 进程存活检查 |
 | `GET /readyz` | 数据库和上游凭证就绪检查；必要时刷新凭证，不发起模型推理 |
 
 Chat Completions 支持 `tools` / `tool_choice`、`parallel_tool_calls`、`temperature`、`reasoning` / `reasoning_effort`、`metadata`、`response_format`（text / json_object / json_schema）。`max_tokens`、`max_completion_tokens` 和 `max_output_tokens` 均映射为上游输出 token 上限，同一请求只能指定一个。网关会保留并透传客户端新增的顶层字段（例如 `prompt_cache_key`、`client_metadata` 和未来字段），不在本地维护完整的上游字段白名单；最终是否支持由上游返回结果决定。
+
+图像生成使用 `POST /v1/images/generations`，请求体遵循 OpenAI Images API（例如 `model`、`prompt`、`size`、`quality`、`n`），网关会将其转发到 Codex Images API 的 `/codex/images/generations`。`/v1/*` 的其他方法和路径在 API Key 鉴权后保留原始请求体与查询参数转发到对应的 Codex 路径；是否实际可用由上游账号和接口能力决定。
 
 `stream=true` 会增量输出文本、拒绝内容和函数参数。Chat Completions 以 `[DONE]` 结束，可通过 `stream_options.include_usage=true` 获取最终用量；Responses 保留具名事件格式。流式开始前发现错误会返回错误 HTTP 状态；开始后的错误通过 SSE 传递，并在用量日志中记录失败状态。
 

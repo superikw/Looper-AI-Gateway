@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,8 +49,10 @@ from app.schemas import (
     UserOut,
 )
 from app.services import (
+    forward_raw_to_upstream,
     forward_to_upstream,
     parse_request_json,
+    read_request_body,
     record_usage,
     resolve_upstream_bearer_token,
     resolve_upstream_credential,
@@ -454,7 +457,7 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
         model = validate_model(payload["model"])
         await enforce_model_policy(db, model)
         payload["model"] = model
-        if payload["stream"]:
+        if payload.get("stream", False):
             return await stream_to_upstream(path, payload, db, api_key)
         status_code, data, req_id, cid = await forward_to_upstream(
             path, payload, db, api_key.upstream_credential_id
@@ -476,6 +479,62 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
     return JSONResponse(status_code=status_code, content=data, headers=headers)
 
 
+def _raw_json(body: bytes, content_type: str) -> dict[str, Any]:
+    if "json" not in content_type.lower():
+        return {}
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+async def handle_raw_proxy(
+    path: str, request: Request, api_key: ApiKey, db: AsyncSession
+):
+    model = None
+    try:
+        body = await read_request_body(request)
+        payload = _raw_json(body, request.headers.get("content-type", ""))
+        candidate = payload.get("model")
+        if isinstance(candidate, str) and candidate.strip():
+            model = validate_model(candidate)
+            await enforce_model_policy(db, model)
+        status_code, content, req_id, cid, content_type = await forward_raw_to_upstream(
+            path,
+            body,
+            request.method,
+            request.url.query,
+            {
+                "content-type": request.headers.get("content-type", ""),
+                "accept": request.headers.get("accept", "*/*"),
+            },
+            db,
+            api_key.upstream_credential_id,
+        )
+    except HTTPException as exc:
+        await record_usage(
+            db,
+            api_key,
+            path,
+            model,
+            exc.status_code,
+            {"error": {"message": str(exc.detail)}},
+            None,
+            getattr(exc, "upstream_credential_id", None),
+        )
+        raise
+
+    result = _raw_json(content, content_type or "")
+    await record_usage(db, api_key, path, model, status_code, result, req_id, cid)
+    headers = {}
+    if content_type:
+        headers["content-type"] = content_type
+    if req_id:
+        headers["x-request-id"] = req_id
+    return Response(content=content, status_code=status_code, headers=headers)
+
+
 @app.post("/v1/chat/completions")
 async def proxy_chat(
     request: Request,
@@ -494,18 +553,13 @@ async def proxy_responses(
     return await handle_proxy("/v1/responses", request, api_key, db)
 
 
-@app.post("/v1/embeddings")
-async def proxy_embeddings(
+@app.post("/v1/images/generations")
+async def proxy_image_generations(
     request: Request,
     api_key: ApiKey = Depends(require_api_key),
     db: AsyncSession = Depends(get_db),
 ):
-    return await handle_proxy("/v1/embeddings", request, api_key, db)
-
-
-@app.post("/v1/models")
-async def proxy_models_post():
-    raise HTTPException(status_code=405, detail="use GET /v1/models")
+    return await handle_proxy("/v1/images/generations", request, api_key, db)
 
 
 @app.get("/v1/models")
@@ -519,6 +573,21 @@ async def list_models(
         if m not in blocked
     ]
     return {"object": "list", "data": items}
+
+
+@app.api_route(
+    "/v1/{subpath:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def proxy_other_v1_routes(
+    subpath: str,
+    request: Request,
+    api_key: ApiKey = Depends(require_api_key),
+    db: AsyncSession = Depends(get_db),
+):
+    if not subpath:
+        raise HTTPException(status_code=404, detail="v1 route is required")
+    return await handle_raw_proxy(f"/v1/{subpath}", request, api_key, db)
 
 
 if __name__ == "__main__":

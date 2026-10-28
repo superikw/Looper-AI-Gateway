@@ -137,6 +137,10 @@ def _convert_messages_to_input(
 
 
 def build_codex_request_body(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if path.startswith("/v1/images/"):
+        body = dict(payload)
+        body["model"] = canonicalize_model_name(payload.get("model"))
+        return body
     body = {
         "model": canonicalize_model_name(payload.get("model")),
         "store": False,

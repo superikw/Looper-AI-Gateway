@@ -137,21 +137,44 @@ def cooldown_for_response(response: httpx.Response) -> int:
 
 
 async def _send_upstream(
-    path: str, body: dict, bearer: str, account: str
+    path: str,
+    body: dict,
+    bearer: str,
+    account: str,
+    *,
+    method: str = "POST",
+    raw_body: bytes | None = None,
+    query: str = "",
+    request_headers: dict[str, str] | None = None,
 ) -> httpx.Response:
-    url = f"{settings.upstream_base_url.rstrip('/')}/codex/responses"
+    upstream_path = (
+        "/codex/responses"
+        if raw_body is None and path in ("/v1/chat/completions", "/v1/responses")
+        else f"/codex{path.removeprefix('/v1')}"
+    )
+    url = f"{settings.upstream_base_url.rstrip('/')}{upstream_path}"
+    if query:
+        url = f"{url}?{query}"
     headers = {
         "Authorization": f"Bearer {bearer}",
         "chatgpt-account-id": account,
         "OpenAI-Beta": settings.upstream_openai_beta,
         "originator": settings.oauth_originator,
         "User-Agent": "pi (linux x86_64)",
-        "accept": "text/event-stream",
+        "accept": (
+            "application/json"
+            if path.startswith("/v1/images/")
+            else "text/event-stream"
+        ),
     }
-    log_debug("upstream_request", path=path, model=body["model"])
+    for name, value in (request_headers or {}).items():
+        if value and name.lower() not in {"authorization", "host", "content-length"}:
+            headers[name] = value
+    log_debug("upstream_request", path=path, model=body.get("model"))
     client = get_http_client()
+    request_kwargs = {"content": raw_body} if raw_body is not None else {"json": body}
     response = await client.send(
-        client.build_request("POST", url, headers=headers, json=body), stream=True
+        client.build_request(method, url, headers=headers, **request_kwargs), stream=True
     )
     log_debug(
         "upstream_response",
@@ -169,8 +192,30 @@ async def open_upstream(
     payload: dict[str, Any],
     db: AsyncSession | None = None,
     upstream_credential_id: int | None = None,
+    *,
+    raw_body: bytes | None = None,
+    method: str = "POST",
+    query: str = "",
+    request_headers: dict[str, str] | None = None,
 ) -> httpx.Response:
-    body = build_codex_request_body(path, payload)
+    body = {} if raw_body is not None else build_codex_request_body(path, payload)
+
+    async def send(bearer: str, account: str) -> httpx.Response:
+        # Keep the simple call shape for existing transports and test doubles;
+        # only raw passthrough requests need the extended options.
+        if raw_body is None and method == "POST" and not query and not request_headers:
+            return await _send_upstream(path, body, bearer, account)
+        return await _send_upstream(
+            path,
+            body,
+            bearer,
+            account,
+            method=method,
+            raw_body=raw_body,
+            query=query,
+            request_headers=request_headers,
+        )
+
     if settings.upstream_auth_mode != "oauth_manual":
         if upstream_credential_id is not None:
             raise HTTPException(503, "account bindings require oauth_manual mode")
@@ -181,7 +226,7 @@ async def open_upstream(
                 502, "upstream credential does not contain a ChatGPT account ID"
             )
         try:
-            return await _send_upstream(path, body, bearer, account)
+            return await send(bearer, account)
         except httpx.RequestError as exc:
             raise network_error(exc) from None
     if db is None:
@@ -249,7 +294,7 @@ async def open_upstream(
                 last_error = exc
                 continue
             try:
-                response = await _send_upstream(path, body, bearer, account)
+                response = await send(bearer, account)
             except httpx.RequestError as exc:
                 error = network_error(exc)
                 error.upstream_credential_id = cid
@@ -325,7 +370,8 @@ async def iter_upstream_events(response: httpx.Response):
 def format_upstream_result(
     path: str, payload: dict, status_code: int, data: dict
 ) -> tuple[int, dict]:
-    validate_upstream_data(data)
+    if path not in ("/v1/images/generations", "/v1/images/edits"):
+        validate_upstream_data(data)
     if status_code >= 400 or response_failed(data):
         error = data.get("error") or {
             "message": "upstream response failed",
@@ -337,12 +383,16 @@ def format_upstream_result(
         if data.get("usage"):
             result["usage"] = data["usage"]
         return status_code if status_code >= 400 else 502, result
+    if path in ("/v1/images/generations", "/v1/images/edits"):
+        return status_code, data
     if path == "/v1/chat/completions":
         return status_code, normalize_codex_response_to_chat(data, payload["model"])
     return status_code, normalize_codex_response_to_responses(data)
 
 
-async def read_upstream_data(response: httpx.Response) -> dict:
+async def read_upstream_data(
+    response: httpx.Response, path: str | None = None
+) -> dict:
     if (
         "text/event-stream" in response.headers.get("content-type", "")
         and response.status_code < 400
@@ -372,7 +422,9 @@ async def read_upstream_data(response: httpx.Response) -> dict:
         ) from None
     if not isinstance(data, dict):
         raise HTTPException(502, "upstream returned a non-object response")
-    if response.status_code < 400 and not any(
+    if response.status_code < 400 and path not in (
+        "/v1/images/generations", "/v1/images/edits"
+    ) and not any(
         key in data for key in ("output", "output_text", "error")
     ):
         raise HTTPException(502, "upstream returned an invalid response")
@@ -388,7 +440,7 @@ async def forward_to_upstream(
     response = await open_upstream(path, payload, db, upstream_credential_id)
     cid = account_id_for_response(response)
     try:
-        data = await read_upstream_data(response)
+        data = await read_upstream_data(response, path)
         code, result = format_upstream_result(path, payload, response.status_code, data)
         if code >= 400 and response.status_code < 400:
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
@@ -398,6 +450,43 @@ async def forward_to_upstream(
         if response.status_code < 400 and not isinstance(exc, ProxyTransportError):
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
         raise
+    finally:
+        await close_upstream(response)
+
+
+async def forward_raw_to_upstream(
+    path: str,
+    body: bytes,
+    method: str = "POST",
+    query: str = "",
+    request_headers: dict[str, str] | None = None,
+    db: AsyncSession | None = None,
+    upstream_credential_id: int | None = None,
+) -> tuple[int, bytes, str | None, int | None, str | None]:
+    """Forward an authenticated /v1 request without protocol conversion."""
+    response = await open_upstream(
+        path,
+        {},
+        db,
+        upstream_credential_id,
+        raw_body=body,
+        method=method,
+        query=query,
+        request_headers=request_headers,
+    )
+    cid = account_id_for_response(response)
+    try:
+        try:
+            await response.aread()
+        except httpx.RequestError as exc:
+            raise network_error(exc) from None
+        return (
+            response.status_code,
+            response.content,
+            request_id(response),
+            cid,
+            response.headers.get("content-type"),
+        )
     finally:
         await close_upstream(response)
 
@@ -473,11 +562,7 @@ async def record_usage(
 
 
 async def parse_request_json(request: Request) -> dict[str, Any]:
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > settings.max_request_bytes:
-            raise HTTPException(413, "request body exceeds MAX_REQUEST_BYTES")
-        body.extend(chunk)
+    body = await read_request_body(request)
     try:
         result = json.loads(body, parse_constant=reject_constant)
     except (ValueError, UnicodeError):
@@ -485,3 +570,12 @@ async def parse_request_json(request: Request) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise HTTPException(400, "JSON body must be an object")
     return result
+
+
+async def read_request_body(request: Request) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > settings.max_request_bytes:
+            raise HTTPException(413, "request body exceeds MAX_REQUEST_BYTES")
+        body.extend(chunk)
+    return bytes(body)
