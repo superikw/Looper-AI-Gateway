@@ -469,7 +469,8 @@ curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
 | `UPSTREAM_FAILURE_COOLDOWN_SECONDS` | 连接或服务端错误后的冷却秒数，默认 10 |
 | `UPSTREAM_RATE_LIMIT_COOLDOWN_SECONDS` | 429 缺少有效 Retry-After 时的冷却秒数，默认 60 |
 | `UPSTREAM_CAPACITY_WAIT_SECONDS` | RPM、并发或最小间隔受限时最多等待的秒数，默认 15；设为 0 立即返回 429 |
-| `MAX_REQUEST_BYTES` | 请求体大小限制，默认 16777216 字节（16 MiB） |
+| `MAX_REQUEST_BYTES` | 普通请求体大小限制，默认 16777216 字节（16 MiB） |
+| `MAX_IMAGE_REQUEST_BYTES` | 包含图片输入的请求体大小限制（base64 图片会放大 JSON），默认 67108864 字节（64 MiB） |
 | `MODEL_CATALOG` | `/v1/models` 展示列表，默认 `gpt-6.1-sol`；不限制请求模型，留空返回空目录 |
 | `DEFAULT_INSTRUCTIONS` | 缺少指令时使用的默认提示 |
 | `OAUTH_*` | OAuth 地址、客户端标识、回调地址和 PKCE 会话配置 |
@@ -588,6 +589,22 @@ docker compose down
 日志输出事件名、路径、模型、HTTP 状态和上游 request ID，不输出提示词、响应正文、账号 ID 或 token。迁移不会清理已有备份或旧版日志中的敏感内容。
 
 ## 常见问题
+
+### 图片请求提示 `413 Payload Too Large`
+
+图片通常以内嵌 base64 data URL 放在 JSON 中，体积会比原始图片大约三分之一。网关对包含图片字段的 Chat Completions、Responses 和图像接口默认允许 64 MiB；普通请求仍使用 16 MiB 限制。已有部署如果 `.env` 是从旧模板创建的，请补上：
+
+```env
+MAX_IMAGE_REQUEST_BYTES=67108864
+```
+
+然后重建并重启 Gateway：
+
+```bash
+docker compose up -d --build --force-recreate looper-ai-gateway
+```
+
+如果图片仍然超过 64 MiB，可在确认服务器内存足够后提高该值；客户端也可以先压缩图片，或改用可访问的图片 URL，减少请求体积。
 
 ### model blocked 与 model_not_found 有什么区别
 

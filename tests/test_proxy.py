@@ -580,6 +580,29 @@ async def test_body_limit_is_enforced(client, key, monkeypatch):
     assert response.status_code == 413
 
 
+async def test_image_body_uses_extended_limit(client, key, upstream, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "max_request_bytes", 20)
+    monkeypatch.setattr(settings, "max_image_request_bytes", 1024)
+    payload = {
+        "model": "gpt-5.5",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + "eA==" * 30},
+                    }
+                ],
+            }
+        ],
+    }
+    response = await client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert response.status_code == 200
+
+
 async def test_initial_stream_failure_returns_error_http_status(client, key, upstream):
     upstream["body"] = events(
         {

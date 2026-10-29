@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     max_request_bytes: int = Field(
         default=16 * 1024 * 1024, alias="MAX_REQUEST_BYTES", gt=0
     )
+    # Image inputs are commonly sent as base64 data URLs. Their JSON envelope
+    # is substantially larger than a text request, so keep a separate limit
+    # instead of forcing every endpoint to accept large bodies.
+    max_image_request_bytes: int = Field(
+        default=64 * 1024 * 1024, alias="MAX_IMAGE_REQUEST_BYTES", gt=0
+    )
     upstream_transport: Literal["sse"] = Field(
         default="sse", alias="UPSTREAM_TRANSPORT"
     )

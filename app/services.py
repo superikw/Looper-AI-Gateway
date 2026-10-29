@@ -561,8 +561,31 @@ async def record_usage(
     await db.commit()
 
 
-async def parse_request_json(request: Request) -> dict[str, Any]:
-    body = await read_request_body(request)
+IMAGE_REQUEST_PATHS = {
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/images/generations",
+    "/v1/images/edits",
+}
+IMAGE_ENDPOINT_PATHS = {"/v1/images/generations", "/v1/images/edits"}
+IMAGE_BODY_MARKERS = (
+    b'"image_url"',
+    b'"input_image"',
+    b'"data:image/',
+    b'"image_generation"',
+)
+
+
+def request_body_limit(path: str | None = None) -> tuple[int, str]:
+    if path in IMAGE_REQUEST_PATHS:
+        return settings.max_image_request_bytes, "MAX_IMAGE_REQUEST_BYTES"
+    return settings.max_request_bytes, "MAX_REQUEST_BYTES"
+
+
+async def parse_request_json(
+    request: Request, path: str | None = None
+) -> dict[str, Any]:
+    body = await read_request_body(request, path=path)
     try:
         result = json.loads(body, parse_constant=reject_constant)
     except (ValueError, UnicodeError):
@@ -572,10 +595,23 @@ async def parse_request_json(request: Request) -> dict[str, Any]:
     return result
 
 
-async def read_request_body(request: Request) -> bytes:
+async def read_request_body(
+    request: Request, *, path: str | None = None
+) -> bytes:
+    limit, setting_name = request_body_limit(path)
     body = bytearray()
     async for chunk in request.stream():
-        if len(body) + len(chunk) > settings.max_request_bytes:
-            raise HTTPException(413, "request body exceeds MAX_REQUEST_BYTES")
+        if len(body) + len(chunk) > limit:
+            raise HTTPException(413, f"request body exceeds {setting_name}")
         body.extend(chunk)
-    return bytes(body)
+    result = bytes(body)
+    # Chat and Responses requests only need the larger limit when they carry
+    # an image. Keep the ordinary limit for oversized text/tool payloads while
+    # allowing base64 image data URLs through.
+    if (
+        path in IMAGE_REQUEST_PATHS - IMAGE_ENDPOINT_PATHS
+        and len(result) > settings.max_request_bytes
+        and not any(marker in result for marker in IMAGE_BODY_MARKERS)
+    ):
+        raise HTTPException(413, "request body exceeds MAX_REQUEST_BYTES")
+    return result

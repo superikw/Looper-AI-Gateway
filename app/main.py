@@ -453,7 +453,7 @@ async def admin_oauth_account(db: AsyncSession = Depends(get_db)):
 async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSession):
     model = None
     try:
-        payload = validate_proxy_payload(path, await parse_request_json(request))
+        payload = validate_proxy_payload(path, await parse_request_json(request, path))
         model = validate_model(payload["model"])
         await enforce_model_policy(db, model)
         payload["model"] = model
@@ -494,7 +494,7 @@ async def handle_raw_proxy(
 ):
     model = None
     try:
-        body = await read_request_body(request)
+        body = await read_request_body(request, path=path)
         payload = _raw_json(body, request.headers.get("content-type", ""))
         candidate = payload.get("model")
         if isinstance(candidate, str) and candidate.strip():
