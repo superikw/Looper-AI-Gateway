@@ -475,7 +475,14 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
         )
         raise
     await record_usage(db, api_key, path, model, status_code, data, req_id, cid)
-    headers = {"x-request-id": req_id} if req_id else None
+    headers = {}
+    if req_id:
+        headers["x-request-id"] = req_id
+    upstream = data.get("upstream") if isinstance(data, dict) else None
+    if isinstance(upstream, dict):
+        headers["x-upstream-status"] = str(upstream.get("status_code", ""))
+        if upstream.get("request_id"):
+            headers["x-upstream-request-id"] = str(upstream["request_id"])
     return JSONResponse(status_code=status_code, content=data, headers=headers)
 
 

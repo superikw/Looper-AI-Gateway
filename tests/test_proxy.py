@@ -112,6 +112,29 @@ async def test_failed_upstream_event_is_not_success(client, key, upstream):
     assert "choices" not in response.json()
 
 
+async def test_upstream_failure_exposes_provider_diagnostics(client, key, upstream):
+    upstream["body"] = events(
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "message": "overloaded; request id 12345678-1234-1234-1234-123456789abc",
+                    "type": "server_error",
+                },
+            },
+        }
+    )
+    response = await client.post("/v1/chat/completions", headers=AUTH, json=BASE)
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "server_error"
+    assert response.json()["upstream"] == {
+        "status_code": 200,
+        "request_id": "12345678-1234-1234-1234-123456789abc",
+        "response_status": "failed",
+    }
+
+
 async def test_truncated_stream_does_not_become_success(client, key, upstream):
     upstream["body"] = events(
         {"type": "response.output_text.delta", "delta": "partial"}

@@ -27,6 +27,7 @@ from app.services import (
     record_usage,
     request_id,
     should_cooldown_for_result,
+    upstream_request_id,
 )
 from app.upstreams import mark_account_failure
 
@@ -212,10 +213,21 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                         cid, settings.upstream_failure_cooldown_seconds
                     )
                 await close_upstream(response)
+                provider_request_id = upstream_request_id(data)
                 await record_usage(
-                    db, api_key, path, payload["model"], code, result, rid, cid
+                    db,
+                    api_key,
+                    path,
+                    payload["model"],
+                    code,
+                    result,
+                    rid or provider_request_id,
+                    cid,
                 )
-                return JSONResponse(result, status_code=code)
+                headers = {"x-upstream-status": str(response.status_code)}
+                if provider_request_id:
+                    headers["x-upstream-request-id"] = provider_request_id
+                return JSONResponse(result, status_code=code, headers=headers)
 
             async def json_events():
                 yield {"type": "response.completed", "response": data}
@@ -229,15 +241,26 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
             initial.add(first)
         if first is None or (initial.terminal and response_failed(initial.result())):
             code, result = format_upstream_result(path, payload, 200, initial.result())
+            provider_request_id = upstream_request_id(initial.result())
             if should_cooldown_for_result(result):
                 await mark_account_failure(
                     cid, settings.upstream_failure_cooldown_seconds
                 )
             await close_upstream(response)
             await record_usage(
-                db, api_key, path, payload["model"], code, result, rid, cid
+                db,
+                api_key,
+                path,
+                payload["model"],
+                code,
+                result,
+                rid or provider_request_id,
+                cid,
             )
-            return JSONResponse(result, status_code=code)
+            headers = {"x-upstream-status": "200"}
+            if provider_request_id:
+                headers["x-upstream-request-id"] = provider_request_id
+            return JSONResponse(result, status_code=code, headers=headers)
     except BaseException as exc:
         with anyio.CancelScope(shield=True):
             await close_upstream(response)
@@ -262,6 +285,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
         "recorded": False,
         "account_failure": False,
     }
+    upstream_rid = rid
 
     async def cleanup():
         if state["recorded"]:
@@ -283,11 +307,12 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                     payload["model"],
                     state["code"],
                     state["data"],
-                    rid,
+                    upstream_rid,
                     cid,
                 )
 
     async def body():
+        nonlocal upstream_rid
         try:
 
             async def prefixed():
@@ -307,6 +332,7 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                 if accumulator.terminal:
                     break
             data = accumulator.result()
+            upstream_rid = upstream_rid or upstream_request_id(data)
             code, result = format_upstream_result(path, payload, 200, data)
             state.update(
                 code=code,
@@ -342,7 +368,11 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
         finally:
             await cleanup()
 
-    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "x-upstream-status": str(response.status_code),
+    }
     if rid:
         headers["x-request-id"] = rid
     return StreamingResponse(

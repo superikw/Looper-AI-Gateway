@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -365,6 +366,31 @@ def request_id(response: httpx.Response) -> str | None:
     )
 
 
+_REQUEST_ID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+
+
+def upstream_request_id(data: dict[str, Any]) -> str | None:
+    """Find a provider request ID when it was returned in the JSON/SSE body."""
+    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    for value in (
+        data.get("request_id"),
+        data.get("requestId"),
+        error.get("request_id"),
+        error.get("requestId"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for value in (error.get("message"), data.get("message")):
+        if isinstance(value, str):
+            match = _REQUEST_ID_RE.search(value)
+            if match:
+                return match.group(0)
+    return None
+
+
 async def iter_upstream_events(response: httpx.Response):
     lines = []
     try:
@@ -398,6 +424,13 @@ def format_upstream_result(
         result = {"error": error}
         if data.get("usage"):
             result["usage"] = data["usage"]
+        provider_request_id = upstream_request_id(data)
+        result["upstream"] = {
+            "status_code": status_code,
+            "request_id": provider_request_id,
+        }
+        if data.get("status"):
+            result["upstream"]["response_status"] = data["status"]
         return status_code if status_code >= 400 else 502, result
     if path in ("/v1/images/generations", "/v1/images/edits"):
         return status_code, data
@@ -464,7 +497,7 @@ async def forward_to_upstream(
             and should_cooldown_for_result(result)
         ):
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
-        return code, result, request_id(response), cid
+        return code, result, request_id(response) or upstream_request_id(data), cid
     except HTTPException as exc:
         exc.upstream_credential_id = cid
         if response.status_code < 400 and not isinstance(exc, ProxyTransportError):
