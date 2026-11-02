@@ -417,6 +417,31 @@ async def test_stream_failure_does_not_mix_accounts(
         assert (await db.get(UpstreamCredential, accounts[0])).failure_count == 1
 
 
+async def test_shared_overload_does_not_cool_account(
+    client, accounts, key, pool_transport
+):
+    import httpx
+
+    pool_transport["responses"]["account-0"] = lambda request: httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        text=(
+            'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+            'data: {"type":"response.failed","response":{"status":"failed",'
+            '"error":{"message":"Our servers are currently overloaded. Please try again later."}}}\n\n'
+        ),
+    )
+    response = await client.post(
+        "/v1/chat/completions", headers=AUTH, json={**BODY, "stream": True}
+    )
+    assert response.status_code == 200
+    assert "overloaded" in response.text
+    async with AsyncSessionLocal() as db:
+        account = await db.get(UpstreamCredential, accounts[0])
+        assert account.failure_count == 0
+        assert account.cooldown_until is None
+
+
 async def test_all_cooling_accounts_are_unready_until_reset(
     client, accounts, key, pool_transport
 ):

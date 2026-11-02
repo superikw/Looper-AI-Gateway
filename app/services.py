@@ -136,6 +136,22 @@ def cooldown_for_response(response: httpx.Response) -> int:
     return settings.upstream_failure_cooldown_seconds
 
 
+def should_cooldown_for_result(result: dict[str, Any]) -> bool:
+    """Return whether a semantic upstream failure is attributable to an account.
+
+    The Codex backend can return HTTP 200 and report shared model capacity
+    failures in the response body. Cooling the selected account for those
+    failures removes healthy accounts from the pool and turns a model-level
+    outage into a gateway-wide 503. Keep account cooldowns for other semantic
+    failures (for example malformed or account-specific responses).
+    """
+    error = result.get("error") if isinstance(result, dict) else None
+    if not isinstance(error, dict):
+        return True
+    message = str(error.get("message") or "").lower()
+    return "overloaded" not in message
+
+
 async def _send_upstream(
     path: str,
     body: dict,
@@ -442,7 +458,11 @@ async def forward_to_upstream(
     try:
         data = await read_upstream_data(response, path)
         code, result = format_upstream_result(path, payload, response.status_code, data)
-        if code >= 400 and response.status_code < 400:
+        if (
+            code >= 400
+            and response.status_code < 400
+            and should_cooldown_for_result(result)
+        ):
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
         return code, result, request_id(response), cid
     except HTTPException as exc:

@@ -26,6 +26,7 @@ from app.services import (
     read_upstream_data,
     record_usage,
     request_id,
+    should_cooldown_for_result,
 )
 from app.upstreams import mark_account_failure
 
@@ -222,7 +223,10 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
             initial.add(first)
         if first is None or (initial.terminal and response_failed(initial.result())):
             code, result = format_upstream_result(path, payload, 200, initial.result())
-            await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
+            if should_cooldown_for_result(result):
+                await mark_account_failure(
+                    cid, settings.upstream_failure_cooldown_seconds
+                )
             await close_upstream(response)
             await record_usage(
                 db, api_key, path, payload["model"], code, result, rid, cid
@@ -298,7 +302,11 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                     break
             data = accumulator.result()
             code, result = format_upstream_result(path, payload, 200, data)
-            state.update(code=code, data=result, account_failure=code >= 400)
+            state.update(
+                code=code,
+                data=result,
+                account_failure=code >= 400 and should_cooldown_for_result(result),
+            )
             if code >= 400:
                 yield sse(result, "error" if path == "/v1/responses" else None)
             elif path == "/v1/chat/completions":
