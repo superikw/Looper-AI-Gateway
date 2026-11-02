@@ -36,6 +36,12 @@ def sse(data: dict, event: str | None = None) -> str:
     return prefix + "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
 
 
+def response_failed_event(result: dict) -> dict:
+    response = dict(result)
+    response["status"] = "failed"
+    return {"type": "response.failed", "response": response}
+
+
 class ChatStream:
     def __init__(self, model: str, include_usage: bool = False):
         self.id = "chatcmpl-" + uuid.uuid4().hex
@@ -308,7 +314,10 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                 account_failure=code >= 400 and should_cooldown_for_result(result),
             )
             if code >= 400:
-                yield sse(result, "error" if path == "/v1/responses" else None)
+                if path == "/v1/responses":
+                    yield sse(response_failed_event(result), "response.failed")
+                else:
+                    yield sse(result)
             elif path == "/v1/chat/completions":
                 for chunk in chat.finish(data):
                     yield sse(chunk)
@@ -321,7 +330,13 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                 data=error,
                 account_failure=not isinstance(exc, ProxyTransportError),
             )
-            yield sse(error, "error" if path == "/v1/responses" else None)
+            if path == "/v1/responses":
+                yield sse(
+                    response_failed_event(error),
+                    "response.failed",
+                )
+            else:
+                yield sse(error)
             if path == "/v1/chat/completions":
                 yield "data: [DONE]\n\n"
         finally:

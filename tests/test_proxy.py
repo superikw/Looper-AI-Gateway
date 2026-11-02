@@ -405,6 +405,28 @@ async def test_responses_stream_preserves_typed_events(client, key, upstream):
     assert parse_sse_events(response.text)[0]["response"]["id"] == "resp_test"
 
 
+async def test_responses_stream_failure_emits_terminal_failed_event(
+    client, key, upstream
+):
+    upstream["body"] = events(
+        {"type": "response.output_text.delta", "delta": "partial"},
+    )
+    response = await client.post(
+        "/v1/responses",
+        headers=AUTH,
+        json={"model": "gpt-5.5", "input": "hello", "stream": True},
+    )
+    assert response.status_code == 200
+    assert "event: response.failed" in response.text
+    assert "event: error" not in response.text
+    failed = [
+        event
+        for event in parse_sse_events(response.text)
+        if event.get("type") == "response.failed"
+    ]
+    assert failed and failed[-1]["response"]["status"] == "failed"
+
+
 class DelayedStream(httpx.AsyncByteStream):
     def __init__(self):
         self.release = asyncio.Event()
