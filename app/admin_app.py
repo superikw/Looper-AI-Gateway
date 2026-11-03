@@ -11,10 +11,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psutil
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin_service import (
@@ -625,6 +625,7 @@ async def logs(
             "user": username,
             "key": keyname,
             "model": log.model,
+            "path": log.path,
             "status_code": log.status_code,
             "input_tokens": log.prompt_tokens,
             "output_tokens": log.completion_tokens,
@@ -660,7 +661,9 @@ async def clear_logs(
 
 @admin_app.get("/api/sessions")
 async def sessions(
-    _: AdminAccount = Depends(current_admin), db: AsyncSession = Depends(get_db)
+    recent_seconds: int = Query(default=0, ge=0, le=3600),
+    _: AdminAccount = Depends(current_admin),
+    db: AsyncSession = Depends(get_db),
 ):
     stale_before = utcnow() - timedelta(hours=2)
     stale = (
@@ -676,12 +679,20 @@ async def sessions(
         session.finished_at = utcnow()
     if stale:
         await db.commit()
+    visible = ActiveSession.finished_at.is_(None)
+    if recent_seconds:
+        visible = or_(
+            visible,
+            ActiveSession.finished_at >= utcnow() - timedelta(seconds=recent_seconds),
+        )
     rows = (
         await db.execute(
             select(ActiveSession, User.name)
             .join(User, User.id == ActiveSession.user_id)
-            .where(ActiveSession.finished_at.is_(None))
-            .order_by(ActiveSession.started_at.desc())
+            .where(visible)
+            .order_by(
+                ActiveSession.finished_at.is_not(None), ActiveSession.started_at.desc()
+            )
         )
     ).all()
     return [
@@ -693,6 +704,7 @@ async def sessions(
             "status": row.status,
             "started_at": row.started_at,
             "last_event_at": row.last_event_at,
+            "finished_at": row.finished_at,
         }
         for row, name in rows
     ]

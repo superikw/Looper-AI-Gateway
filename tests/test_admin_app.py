@@ -413,3 +413,76 @@ async def test_remote_http_login_allowed_by_default(admin_client, monkeypatch):
         assert "HttpOnly" in response.headers["set-cookie"]
         assert "Secure" not in response.headers["set-cookie"]
         assert (await client.get("/api/me")).status_code == 200
+
+
+async def test_log_api_includes_original_interface(admin_client, key):
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        for path in ("/v1/responses", "/v1/chat/completions"):
+            db.add(
+                UsageLog(
+                    user_id=key.user_id,
+                    api_key_id=key.id,
+                    path=path,
+                    model="gpt-test",
+                    status_code=200,
+                )
+            )
+        await db.commit()
+    logs = (await admin_client.get("/api/logs")).json()
+    assert {log["path"] for log in logs} == {"/v1/responses", "/v1/chat/completions"}
+
+
+@pytest.mark.parametrize(
+    "path", ["/v1/responses", "/v1/chat/completions", "/v1/embeddings"]
+)
+async def test_live_sessions_and_recently_finished_requests(
+    admin_client, client, key, monkeypatch, path
+):
+    import asyncio
+    from datetime import timedelta
+
+    from app.models import ActiveSession
+    from app.utils import utcnow
+
+    await sign_in(admin_client)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def forward(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        if path == "/v1/embeddings":
+            return 200, b"{}", None, None, "application/json"
+        return 200, {}, None, None
+
+    monkeypatch.setattr("app.main.forward_to_upstream", forward)
+    monkeypatch.setattr("app.main.forward_raw_to_upstream", forward)
+    payload = (
+        {"model": "gpt-test", "input": "hello"}
+        if path != "/v1/chat/completions"
+        else {"model": "gpt-test", "messages": [{"role": "user", "content": "hello"}]}
+    )
+    pending = asyncio.create_task(
+        client.post(path, headers={"Authorization": "Bearer gtw_test"}, json=payload)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        live = (await admin_client.get("/api/sessions")).json()
+        assert len(live) == 1 and live[0]["path"] == path
+        assert live[0]["status"] == "running" and live[0]["finished_at"] is None
+    finally:
+        release.set()
+        response = await asyncio.wait_for(pending, 2)
+    assert response.status_code == 200
+    assert (await admin_client.get("/api/sessions")).json() == []
+    recent = (await admin_client.get("/api/sessions?recent_seconds=300")).json()
+    assert len(recent) == 1 and recent[0]["status"] == "completed"
+    assert recent[0]["finished_at"] is not None
+    async with AsyncSessionLocal() as db:
+        row = await db.get(ActiveSession, recent[0]["id"])
+        row.finished_at = utcnow() - timedelta(minutes=6)
+        await db.commit()
+    assert (await admin_client.get("/api/sessions?recent_seconds=300")).json() == []
+    assert (
+        await admin_client.get("/api/sessions?recent_seconds=-1")
+    ).status_code == 422

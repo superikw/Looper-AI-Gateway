@@ -671,7 +671,10 @@ async def test_embeddings_are_forwarded_by_generic_v1_proxy(client, key, upstrea
     )
     assert response.status_code == 200
     assert response.json() == {"data": []}
-    assert str(upstream["requests"][-1].url) == "https://chatgpt.com/backend-api/codex/embeddings"
+    assert (
+        str(upstream["requests"][-1].url)
+        == "https://chatgpt.com/backend-api/codex/embeddings"
+    )
 
 
 async def test_image_generation_uses_images_endpoint_and_preserves_response(
@@ -687,13 +690,13 @@ async def test_image_generation_uses_images_endpoint_and_preserves_response(
         "size": "1024x1024",
         "quality": "high",
     }
-    response = await client.post(
-        "/v1/images/generations", headers=AUTH, json=payload
-    )
+    response = await client.post("/v1/images/generations", headers=AUTH, json=payload)
     assert response.status_code == 200
     assert response.json()["data"][0]["b64_json"] == "aGVsbG8="
     request = upstream["requests"][-1]
-    assert str(request.url) == "https://chatgpt.com/backend-api/codex/images/generations"
+    assert (
+        str(request.url) == "https://chatgpt.com/backend-api/codex/images/generations"
+    )
     assert json.loads(request.content) == payload
 
 
@@ -710,7 +713,9 @@ async def test_unknown_v1_route_is_authenticated_and_forwarded_verbatim(
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     request = upstream["requests"][-1]
-    assert str(request.url) == "https://chatgpt.com/backend-api/codex/files?purpose=test"
+    assert (
+        str(request.url) == "https://chatgpt.com/backend-api/codex/files?purpose=test"
+    )
     assert request.content == b"raw-body"
 
 
@@ -780,3 +785,21 @@ async def test_refusal_deltas_remain_refusals(client, key, upstream):
     message = response.json()["choices"][0]["message"]
     assert message["refusal"] == "cannot help"
     assert message["content"] is None
+
+
+async def test_stream_http_error_finishes_active_session(client, key, upstream):
+    from app.models import ActiveSession
+
+    upstream.update(
+        status=400,
+        content_type="application/json",
+        body=b'{"error":{"message":"bad request"}}',
+    )
+    response = await client.post(
+        "/v1/chat/completions", headers=AUTH, json={**BASE, "stream": True}
+    )
+    assert response.status_code == 400
+    async with AsyncSessionLocal() as db:
+        session = await db.scalar(select(ActiveSession))
+        assert session.status == "failed"
+        assert session.finished_at is not None

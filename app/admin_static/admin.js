@@ -67,9 +67,9 @@ async function render() {
   config = await api('/api/settings');
   let html = '';
   if (page === '/dashboard') {
-    const [dash,sessions,logs] = await Promise.all([api('/api/dashboard'),api('/api/sessions'),api('/api/logs?limit=10')]);
+    const [dash,sessions,logs] = await Promise.all([api('/api/dashboard'),api('/api/sessions?recent_seconds=300'),api('/api/logs?limit=10')]);
     const periods = {day:'今天',yesterday:'昨天',week:'本周',month:'本月'};
-    html = `<div class="cards">${Object.entries(dash.periods).map(([key,v])=>`<section class="card"><h3>${periods[key]}</h3><div class="metric">${v.requests} 请求</div><p>${v.tokens} tokens · ${money(v.cost_usd)}</p></section>`).join('')}</div><section class="panel">CPU ${dash.system.cpu_percent}% · 内存 ${dash.system.memory_percent}% · 磁盘 ${dash.system.disk_percent}% · 活动会话 ${sessions.length}</section><h2>活动会话</h2>${table(['用户','模型','路径','状态','开始时间','最近活动'],sessions.map(s=>`<tr><td>${esc(s.user)}</td><td>${esc(s.model)}</td><td>${esc(s.path)}</td><td>${esc(s.status)}</td><td>${date(s.started_at)}</td><td>${date(s.last_event_at)}</td></tr>`))}<h2>最近请求</h2>${logTable(logs)}`;
+    html = `<div class="cards">${Object.entries(dash.periods).map(([key,v])=>`<section class="card"><h3>${periods[key]}</h3><div class="metric">${v.requests} 请求</div><p>${v.tokens} tokens · ${money(v.cost_usd)}</p></section>`).join('')}</div><section class="panel">CPU ${dash.system.cpu_percent}% · 内存 ${dash.system.memory_percent}% · 磁盘 ${dash.system.disk_percent}% · 活动会话 <span id="active-session-count">${sessions.filter(s=>!s.finished_at).length}</span></section><h2>活动会话</h2><p class="muted">每 3 秒刷新；同时保留最近 5 分钟已结束的会话。</p><div id="session-list">${sessionTable(sessions)}</div><h2>最近请求</h2>${logTable(logs)}`;
   } else if (page === '/users') {
     const [users,pool] = await Promise.all([api('/api/users'),api('/api/upstreams')]);
     window.viewUsers = users; window.viewAccounts = pool.accounts;
@@ -92,7 +92,29 @@ async function render() {
   shell(); document.querySelector('#content').innerHTML = html;
 }
 function logTable(logs) {
-  return table(['时间','用户 / Key','模型','状态','输入 / 输出','Tokens','费用','错误'],logs.map(x=>`<tr><td>${date(x.created_at)}</td><td>${esc(x.user)}<br><small>${esc(x.key)}</small></td><td>${esc(x.model)}</td><td>${x.status_code}</td><td>${x.input_tokens} / ${x.output_tokens}</td><td>${x.total_tokens}</td><td>${money(x.cost_usd)}</td><td class="error">${esc(x.error)}</td></tr>`));
+  return table(['时间','用户 / Key','接口','模型','状态','输入 / 输出','Tokens','费用','错误'],logs.map(x=>`<tr><td>${date(x.created_at)}</td><td>${esc(x.user)}<br><small>${esc(x.key)}</small></td><td>${interfaceHTML(x.path)}</td><td>${esc(x.model)}</td><td>${x.status_code}</td><td>${x.input_tokens} / ${x.output_tokens}</td><td>${x.total_tokens}</td><td>${money(x.cost_usd)}</td><td class="error">${esc(x.error)}</td></tr>`));
+}
+function interfaceHTML(path) {
+  const label = {'/v1/responses':'Responses','/v1/chat/completions':'Chat Completions'}[path];
+  return label ? `${label}<small>${esc(path)}</small>` : esc(path || '—');
+}
+function sessionTable(sessions) {
+  const statuses = {running:'进行中',completed:'已完成',failed:'失败',stale:'已超时'};
+  return table(['用户','模型','接口','状态','开始时间','最近活动','结束时间'],sessions.map(s=>`<tr><td>${esc(s.user)}</td><td>${esc(s.model)}</td><td>${interfaceHTML(s.path)}</td><td>${esc(statuses[s.status] || s.status)}</td><td>${date(s.started_at)}</td><td>${date(s.last_event_at)}</td><td>${date(s.finished_at)}</td></tr>`));
+}
+let refreshingSessions = false;
+async function refreshSessions() {
+  if (!me || page !== '/dashboard' || refreshingSessions || document.hidden) return;
+  const current = generation;
+  refreshingSessions = true;
+  try {
+    const sessions = await api('/api/sessions?recent_seconds=300');
+    if (current !== generation || page !== '/dashboard') return;
+    const list = document.querySelector('#session-list');
+    const count = document.querySelector('#active-session-count');
+    if (list) list.innerHTML = sessionTable(sessions);
+    if (count) count.textContent = sessions.filter(s=>!s.finished_at).length;
+  } finally {refreshingSessions = false;}
 }
 function quotaHTML(quota) {
   if (!quota) return '<p class="muted">尚未获取上游额度</p>';
@@ -103,10 +125,13 @@ function routeForm(kind, id) {
   const subject = (userSide?window.viewUsers:window.viewAccounts).find(x=>x.id===id);
   const choices = userSide?window.viewAccounts:window.viewUsers;
   const selected = userSide?subject.upstream_ids:subject.user_ids;
-  modal(userSide?'分配上游账户':'分配路由用户', `<p>支持多选，全部取消即无路由。</p>${choices.map(x=>`<label class="check"><input type="checkbox" name="ids" value="${x.id}" ${selected.includes(x.id)?'checked':''}>${esc(x.name || '#'+x.id)}</label>`).join('') || '<p>暂无可分配项。</p>'}`, data => send(userSide?`/api/users/${id}/upstreams`:`/api/upstreams/${id}/users`,'PUT',{[userSide?'upstream_ids':'user_ids']:data.getAll('ids').map(Number)}));
+  modal(userSide?'分配上游账户':'分配路由用户', `<p>支持多选，全部取消即无路由。</p><div class="toolbar">${button('routes-select-all','全选')}${button('routes-invert','反选')}</div>${choices.map(x=>`<label class="check"><input type="checkbox" name="ids" value="${x.id}" ${selected.includes(x.id)?'checked':''}>${esc(x.name || '#'+x.id)}</label>`).join('') || '<p>暂无可分配项。</p>'}`, data => send(userSide?`/api/users/${id}/upstreams`:`/api/upstreams/${id}/users`,'PUT',{[userSide?'upstream_ids':'user_ids']:data.getAll('ids').map(Number)}));
 }
 async function act(action, id) {
   switch(action) {
+    case 'routes-select-all': case 'routes-invert':
+      document.querySelectorAll('dialog[open] input[name="ids"]').forEach(input=>{input.checked=action==='routes-select-all' || !input.checked;});
+      return;
     case 'password': passwordForm(); return;
     case 'logout': await send('/api/logout','POST'); me=null; showLogin(); return;
     case 'refresh': await render(); return;
@@ -166,3 +191,5 @@ window.addEventListener('popstate',()=>{page=location.pathname;render().catch(er
 async function boot(){if(!names[page]){page='/dashboard';history.replaceState({},'',page);}try{me=await api('/api/me');await render();}catch(error){if(error.status!==401)notice(error.message);}}
 boot();
 setInterval(()=>{if(me && !document.querySelector('dialog[open]') && ['/dashboard','/upstreams'].includes(page)) render().catch(error=>notice(error.message));},30000);
+
+setInterval(()=>refreshSessions().catch(error=>notice(error.message)),3000);

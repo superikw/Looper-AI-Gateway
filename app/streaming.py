@@ -194,15 +194,16 @@ class ChatStream:
         return chunks
 
 
-async def stream_to_upstream(path: str, payload: dict, db, api_key, active_id: str | None = None):
+async def stream_to_upstream(
+    path: str, payload: dict, db, api_key, active_id: str | None = None
+):
     response = await open_upstream(path, payload, db, api_key.upstream_credential_id)
     rid = request_id(response)
     cid = account_id_for_response(response)
     content_type = response.headers.get("content-type", "")
     try:
-        if (
-            response.status_code >= 400
-            or (content_type and "text/event-stream" not in content_type)
+        if response.status_code >= 400 or (
+            content_type and "text/event-stream" not in content_type
         ):
             data = await read_upstream_data(response)
             code, result = format_upstream_result(
@@ -225,6 +226,8 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key, active_id: s
                     rid or provider_request_id,
                     cid,
                 )
+                if active_id:
+                    await finish_active_session(active_id, "failed")
                 headers = {"x-upstream-status": str(response.status_code)}
                 if provider_request_id:
                     headers["x-upstream-request-id"] = provider_request_id
@@ -314,7 +317,9 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key, active_id: s
                     cid,
                 )
             if active_id:
-                await finish_active_session(active_id, "completed" if state["code"] < 400 else "failed")
+                await finish_active_session(
+                    active_id, "completed" if state["code"] < 400 else "failed"
+                )
 
     async def body():
         nonlocal upstream_rid

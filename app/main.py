@@ -480,7 +480,9 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
             getattr(exc, "upstream_credential_id", None),
         )
         raise
-    await finish_active_session(active_id, "completed" if status_code < 400 else "failed")
+    await finish_active_session(
+        active_id, "completed" if status_code < 400 else "failed"
+    )
     await record_usage(db, api_key, path, model, status_code, data, req_id, cid)
     headers = {}
     if req_id:
@@ -514,6 +516,9 @@ async def handle_raw_proxy(
         if isinstance(candidate, str) and candidate.strip():
             model = validate_model(candidate)
             await enforce_model_policy(db, model)
+        active_id = await start_active_session(
+            db, api_key.user_id, api_key.id, path, model or ""
+        )
         status_code, content, req_id, cid, content_type = await forward_raw_to_upstream(
             path,
             body,
@@ -527,6 +532,8 @@ async def handle_raw_proxy(
             api_key.upstream_credential_id,
         )
     except HTTPException as exc:
+        if "active_id" in locals():
+            await finish_active_session(active_id, "failed")
         await record_usage(
             db,
             api_key,
@@ -539,6 +546,9 @@ async def handle_raw_proxy(
         )
         raise
 
+    await finish_active_session(
+        active_id, "completed" if status_code < 400 else "failed"
+    )
     result = _raw_json(content, content_type or "")
     await record_usage(db, api_key, path, model, status_code, result, req_id, cid)
     headers = {}
