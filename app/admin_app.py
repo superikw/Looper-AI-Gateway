@@ -35,6 +35,8 @@ from app.models import (
     ApiKey,
     AppSetting,
     ModelPrice,
+    UpstreamAttempt,
+    UpstreamCredential,
     UsageLog,
     User,
     UserUpstreamRoute,
@@ -45,8 +47,10 @@ from app.schemas import (
     AdminPasswordChange,
     ModelPriceIn,
     SettingUpdate,
+    UserLimitsUpdate,
     UserProvision,
 )
+from app.token_utils import account_display_name
 from app.utils import make_api_key, mask_key, sha256_text, utcnow
 
 
@@ -60,6 +64,11 @@ async def lifespan(_: FastAPI):
         await db.execute(
             delete(UsageLog).where(
                 UsageLog.created_at < utcnow() - timedelta(days=days)
+            )
+        )
+        await db.execute(
+            delete(UpstreamAttempt).where(
+                UpstreamAttempt.created_at < utcnow() - timedelta(days=days)
             )
         )
         await db.commit()
@@ -369,6 +378,9 @@ async def users(
                 "name": user.name,
                 "note": user.note,
                 "enabled": user.enabled,
+                "max_concurrency": user.max_concurrency,
+                "max_rpm": user.max_rpm,
+                "min_interval_seconds": user.min_interval_seconds,
                 "created_at": user.created_at,
                 "usage": usage,
                 "upstream_ids": list(
@@ -416,6 +428,22 @@ async def create_user(
     )
     await db.commit()
     return {"id": user.id, "name": user.name, "api_key": raw_key}
+
+
+@admin_app.patch("/api/users/{user_id}/limits")
+async def update_user_limits(
+    user_id: int,
+    payload: UserLimitsUpdate,
+    _: AdminAccount = Depends(current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.get(User, user_id)
+    if not user or user.deleted_at is not None:
+        raise HTTPException(404, "user not found")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(user, field, value)
+    await db.commit()
+    return {"ok": True}
 
 
 @admin_app.delete("/api/users/{user_id}")
@@ -610,9 +638,21 @@ async def logs(
     limit = min(max(limit, 1), 500)
     rows = (
         await db.execute(
-            select(UsageLog, User.name, ApiKey.name)
+            select(
+                UsageLog,
+                User.name,
+                ApiKey.name,
+                UpstreamCredential.name,
+                UpstreamCredential.upstream_email,
+                UpstreamCredential.upstream_name,
+                UpstreamCredential.account_id,
+            )
             .join(User, User.id == UsageLog.user_id)
             .join(ApiKey, ApiKey.id == UsageLog.api_key_id)
+            .outerjoin(
+                UpstreamCredential,
+                UpstreamCredential.id == UsageLog.upstream_credential_id,
+            )
             .order_by(UsageLog.id.desc())
             .limit(limit)
             .offset(max(offset, 0))
@@ -626,6 +666,7 @@ async def logs(
             "key": keyname,
             "model": log.model,
             "path": log.path,
+            "gateway_request_id": log.gateway_request_id,
             "status_code": log.status_code,
             "input_tokens": log.prompt_tokens,
             "output_tokens": log.completion_tokens,
@@ -633,9 +674,40 @@ async def logs(
             "cost_usd": log.cost_usd,
             "error": log.error_message,
             "upstream_request_id": log.upstream_request_id,
+            "upstream_credential_id": log.upstream_credential_id,
+            "upstream_account_id": upstream_account_id,
+            "upstream_display_name": account_display_name(
+                upstream_name,
+                upstream_email,
+                upstream_profile_name,
+                upstream_account_id,
+                log.upstream_credential_id,
+            )
+            if log.upstream_credential_id is not None
+            else None,
         }
-        for log, username, keyname in rows
+        for log, username, keyname, upstream_name, upstream_email, upstream_profile_name, upstream_account_id in rows
     ]
+
+
+@admin_app.get("/api/logs/{log_id}/attempts")
+async def log_attempts(
+    log_id: int,
+    _: AdminAccount = Depends(current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    log = await db.get(UsageLog, log_id)
+    if not log:
+        raise HTTPException(404, "request log not found")
+    if not log.gateway_request_id:
+        return []
+    return (
+        await db.scalars(
+            select(UpstreamAttempt)
+            .where(UpstreamAttempt.gateway_request_id == log.gateway_request_id)
+            .order_by(UpstreamAttempt.attempt)
+        )
+    ).all()
 
 
 @admin_app.delete("/api/logs")
@@ -646,9 +718,15 @@ async def clear_logs(
 ):
     if all_logs:
         result = await db.execute(delete(UsageLog))
+        await db.execute(delete(UpstreamAttempt))
     else:
         days = int(
             await setting(db, "log_retention_days", str(settings.log_retention_days))
+        )
+        await db.execute(
+            delete(UpstreamAttempt).where(
+                UpstreamAttempt.created_at < utcnow() - timedelta(days=days)
+            )
         )
         result = await db.execute(
             delete(UsageLog).where(

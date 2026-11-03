@@ -116,7 +116,7 @@ class ApiKeyBinding(BaseModel):
 
 class UpstreamAccountUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str | None = Field(default=None, min_length=1, max_length=128)
+    name: str | None = Field(default=None, max_length=128)
     enabled: StrictBool | None = None
     max_rpm: int = Field(default=30, strict=True, ge=1, le=100000)
     max_concurrency: int = Field(default=4, strict=True, ge=1, le=10000)
@@ -134,3 +134,10 @@ class UserRouteUpdate(BaseModel):
 class UpstreamRouteUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     user_ids: list[int] = Field(max_length=1000)
+
+
+class UserLimitsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    max_concurrency: int = Field(default=2, strict=True, ge=1, le=10000)
+    max_rpm: int = Field(default=0, strict=True, ge=0, le=100000)
+    min_interval_seconds: float = Field(default=0, ge=0, le=3600, allow_inf_nan=False)

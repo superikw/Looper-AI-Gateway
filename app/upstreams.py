@@ -18,13 +18,15 @@ from app.http_client import ProxyTransportError
 from app.locks import database_lock, lock_path, try_process_lock
 from app.models import UpstreamCredential, UpstreamRequest, UserUpstreamRoute
 from app.oauth_manual import get_active_upstream_credential
-from app.token_utils import extract_account_id_from_token
+from app.token_utils import account_display_name, extract_account_id_from_token
 from app.utils import utcnow
 
 ACCOUNT_FIELDS = (
     "id",
     "name",
     "account_id",
+    "upstream_email",
+    "upstream_name",
     "enabled",
     "max_rpm",
     "max_concurrency",
@@ -368,7 +370,16 @@ async def list_accounts(db, include_deleted: bool = False) -> list[dict]:
     )
     if not include_deleted:
         query = query.where(UpstreamCredential.deleted_at.is_(None))
-    return [dict(row._mapping) for row in (await db.execute(query)).all()]
+    rows = [dict(row._mapping) for row in (await db.execute(query)).all()]
+    for row in rows:
+        row["display_name"] = account_display_name(
+            row["name"],
+            row["upstream_email"],
+            row["upstream_name"],
+            row["account_id"],
+            row["id"],
+        )
+    return rows
 
 
 async def update_account(db, cid: int, changes: dict) -> None:

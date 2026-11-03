@@ -33,3 +33,35 @@ def extract_account_id_from_token(access_token: str) -> str | None:
         if isinstance(account_id, str) and account_id:
             return account_id
     return None
+
+
+def extract_identity(token_data: dict[str, Any]) -> dict[str, str | None]:
+    """Optional display metadata only; never used for authentication."""
+    sources = [token_data]
+    for field in ("id_token", "access_token"):
+        payload = _decode_jwt_payload(token_data.get(field))
+        if payload:
+            sources.append(payload)
+            profile = payload.get("https://api.openai.com/profile")
+            if isinstance(profile, dict):
+                sources.append(profile)
+
+    def first(key):
+        for source in sources:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:255]
+        return None
+
+    return {"upstream_email": first("email"), "upstream_name": first("name")}
+
+
+def account_display_name(name, email, upstream_name, account_id, local_id) -> str:
+    return next(
+        (
+            value.strip()
+            for value in (name, email, upstream_name, account_id)
+            if isinstance(value, str) and value.strip()
+        ),
+        f"账户 #{local_id}",
+    )

@@ -18,7 +18,7 @@ from app.config import settings
 from app.http_client import post_oauth
 from app.locks import database_lock
 from app.models import OAuthSession, UpstreamCredential, UserUpstreamRoute
-from app.token_utils import extract_account_id_from_token
+from app.token_utils import extract_account_id_from_token, extract_identity
 from app.utils import utcnow
 
 
@@ -271,6 +271,9 @@ async def complete_oauth_session(
                 current.scope = token_data.get("scope")
                 current.expires_at = expires_at
                 current.account_id = account_id
+                for field, value in extract_identity(token_data).items():
+                    if value:
+                        setattr(current, field, value)
                 current.enabled = True
                 current.cooldown_until = None
                 if name is not None:
@@ -345,6 +348,9 @@ async def refresh_upstream_credential(
     credential.account_id = (
         extract_account_id(credential.access_token, data) or credential.account_id
     )
+    for field, value in extract_identity(data).items():
+        if value:
+            setattr(credential, field, value)
     credential.raw_json = json.dumps(data, ensure_ascii=False)
     credential.updated_at = _now()
     await db.commit()

@@ -24,7 +24,10 @@ def proxy_transport_error(exc: httpx.RequestError) -> ProxyTransportError | None
     # A proxy connection error is explicit. For the configured shared route,
     # other transport failures cannot reliably be attributed to an account.
     if settings.upstream_proxy_url or isinstance(exc, httpx.ProxyError):
-        return ProxyTransportError(isinstance(exc, httpx.TimeoutException))
+        error = ProxyTransportError(isinstance(exc, httpx.TimeoutException))
+        error.failure_category = "proxy_transport"
+        error.transport_exception_type = type(exc).__name__
+        return error
     return None
 
 

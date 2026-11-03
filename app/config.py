@@ -47,6 +47,20 @@ class Settings(BaseSettings):
     upstream_max_attempts: int = Field(
         default=3, alias="UPSTREAM_MAX_ATTEMPTS", ge=1, le=10
     )
+    sse_early_retry: bool = Field(default=True, alias="SSE_EARLY_RETRY")
+    sse_preview_max_events: int = Field(
+        default=8, alias="SSE_PREVIEW_MAX_EVENTS", ge=1, le=64
+    )
+    sse_preview_max_bytes: int = Field(
+        default=65536,
+        alias="SSE_PREVIEW_MAX_BYTES",
+        ge=1024,
+        le=262144,
+        multiple_of=1024,
+    )
+    sse_preview_max_seconds: float = Field(
+        default=1.0, alias="SSE_PREVIEW_MAX_SECONDS", gt=0, le=5
+    )
     upstream_failure_cooldown_seconds: int = Field(
         default=10, alias="UPSTREAM_FAILURE_COOLDOWN_SECONDS", ge=1, le=3600
     )
@@ -79,7 +93,9 @@ class Settings(BaseSettings):
         alias="MODEL_CATALOG",
     )
     timezone: str = Field(default="", alias="TIMEZONE")
-    log_retention_days: int = Field(default=7, alias="LOG_RETENTION_DAYS", ge=1, le=3650)
+    log_retention_days: int = Field(
+        default=7, alias="LOG_RETENTION_DAYS", ge=1, le=3650
+    )
 
     oauth_authorize_url: str = Field(
         default="https://auth.openai.com/oauth/authorize", alias="OAUTH_AUTHORIZE_URL"

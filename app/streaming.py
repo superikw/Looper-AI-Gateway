@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -8,8 +9,16 @@ import anyio
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 
 from app.activity import finish_active_session
+from app.attempts import (
+    current_trace,
+    finish_response,
+    internal_error,
+    response_attempt,
+    result_category,
+)
 from app.config import settings
 from app.db import AsyncSessionLocal
 from app.http_client import ProxyTransportError
@@ -210,7 +219,10 @@ async def stream_to_upstream(
                 path, payload, response.status_code, data
             )
             if code >= 400:
-                if response.status_code < 400:
+                finish_response(
+                    response, result_category(response, data), result=result
+                )
+                if response.status_code < 400 and should_cooldown_for_result(result):
                     await mark_account_failure(
                         cid, settings.upstream_failure_cooldown_seconds
                     )
@@ -229,6 +241,8 @@ async def stream_to_upstream(
                 if active_id:
                     await finish_active_session(active_id, "failed")
                 headers = {"x-upstream-status": str(response.status_code)}
+                if rid:
+                    headers["x-request-id"] = rid
                 if provider_request_id:
                     headers["x-upstream-request-id"] = provider_request_id
                 return JSONResponse(result, status_code=code, headers=headers)
@@ -239,13 +253,20 @@ async def stream_to_upstream(
             events = json_events()
         else:
             events = iter_upstream_events(response)
-        first = await anext(events, None)
+        preview = response.extensions.get("gateway_preview")
+        defer_first = preview is not None and preview.boundary_reached
+        first = None if defer_first else await anext(events, None)
         initial = ResponseAccumulator()
         if first is not None:
             initial.add(first)
-        if first is None or (initial.terminal and response_failed(initial.result())):
+        if (first is None and not defer_first) or (
+            initial.terminal and response_failed(initial.result())
+        ):
             code, result = format_upstream_result(path, payload, 200, initial.result())
             provider_request_id = upstream_request_id(initial.result())
+            finish_response(
+                response, result_category(response, initial.result()), result=result
+            )
             if should_cooldown_for_result(result):
                 await mark_account_failure(
                     cid, settings.upstream_failure_cooldown_seconds
@@ -264,16 +285,32 @@ async def stream_to_upstream(
             if active_id:
                 await finish_active_session(active_id, "failed")
             headers = {"x-upstream-status": "200"}
+            if rid:
+                headers["x-request-id"] = rid
             if provider_request_id:
                 headers["x-upstream-request-id"] = provider_request_id
             return JSONResponse(result, status_code=code, headers=headers)
     except BaseException as exc:
         with anyio.CancelScope(shield=True):
+            category = (
+                "client_cancelled"
+                if isinstance(exc, asyncio.CancelledError)
+                else getattr(
+                    exc,
+                    "failure_category",
+                    "sse_protocol"
+                    if isinstance(exc, HTTPException)
+                    else "gateway_internal",
+                )
+            )
+            finish_response(response, category, exc=exc)
             await close_upstream(response)
             if isinstance(exc, HTTPException):
                 exc.upstream_credential_id = cid
-                if response.status_code < 400 and not isinstance(
-                    exc, ProxyTransportError
+                if (
+                    response.status_code < 400
+                    and not isinstance(exc, ProxyTransportError)
+                    and not getattr(exc, "transport_exception_type", None)
                 ):
                     await mark_account_failure(
                         cid, settings.upstream_failure_cooldown_seconds
@@ -286,8 +323,9 @@ async def stream_to_upstream(
         (payload.get("stream_options") or {}).get("include_usage", False),
     )
     state = {
-        "code": 499,
-        "data": {"error": {"message": "client disconnected"}},
+        "code": 500,
+        "data": {"error": {"message": "gateway internal error"}},
+        "category": "gateway_internal",
         "recorded": False,
         "account_failure": False,
     }
@@ -300,7 +338,17 @@ async def stream_to_upstream(
         # FastAPI may close the request-scoped DB session before streaming.
         # A fresh session and a cancellation shield preserve the final audit row.
         with anyio.CancelScope(shield=True):
-            await close_upstream(response)
+            attempt = response_attempt(response)
+            if attempt:
+                attempt.request_id = upstream_rid or attempt.request_id
+            finish_response(response, state["category"], result=state["data"])
+            try:
+                await close_upstream(response)
+            finally:
+                await finalize_usage()
+
+    async def finalize_usage():
+        with anyio.CancelScope(shield=True):
             if state["account_failure"]:
                 await mark_account_failure(
                     cid, settings.upstream_failure_cooldown_seconds
@@ -326,7 +374,8 @@ async def stream_to_upstream(
         try:
 
             async def prefixed():
-                yield first
+                if first is not None:
+                    yield first
                 async for event in events:
                     yield event
 
@@ -347,6 +396,7 @@ async def stream_to_upstream(
             state.update(
                 code=code,
                 data=result,
+                category=result_category(response, data),
                 account_failure=code >= 400 and should_cooldown_for_result(result),
             )
             if code >= 400:
@@ -364,7 +414,9 @@ async def stream_to_upstream(
             state.update(
                 code=exc.status_code,
                 data=error,
-                account_failure=not isinstance(exc, ProxyTransportError),
+                category=getattr(exc, "failure_category", "sse_protocol"),
+                account_failure=not isinstance(exc, ProxyTransportError)
+                and not getattr(exc, "transport_exception_type", None),
             )
             if path == "/v1/responses":
                 yield sse(
@@ -375,6 +427,24 @@ async def stream_to_upstream(
                 yield sse(error)
             if path == "/v1/chat/completions":
                 yield "data: [DONE]\n\n"
+        except asyncio.CancelledError:
+            state.update(
+                code=499,
+                data={"error": {"message": "client disconnected"}},
+                category="client_cancelled",
+                account_failure=False,
+            )
+            raise
+        except Exception as exc:
+            state.update(
+                code=500,
+                data={"error": {"message": "gateway internal error"}},
+                category="gateway_internal",
+                account_failure=False,
+            )
+            trace = current_trace.get()
+            internal_error(exc, trace.id if trace else "unknown")
+            raise
         finally:
             await cleanup()
 
@@ -385,7 +455,49 @@ async def stream_to_upstream(
     }
     if rid:
         headers["x-request-id"] = rid
-    return StreamingResponse(
+
+    class ClosingStreamingResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            def cancelled():
+                if not state["recorded"]:
+                    state.update(
+                        code=499,
+                        data={"error": {"message": "client disconnected"}},
+                        category="client_cancelled",
+                        account_failure=False,
+                    )
+
+            async def checked_send(message):
+                try:
+                    await send(message)
+                except OSError:
+                    cancelled()
+                    raise ClientDisconnect() from None
+
+            try:
+                await super().__call__(scope, receive, checked_send)
+            except (asyncio.CancelledError, ClientDisconnect):
+                cancelled()
+                raise
+            except Exception:
+                if not state["recorded"] and state["category"] != "client_cancelled":
+                    state.update(
+                        code=500,
+                        data={"error": {"message": "gateway internal error"}},
+                        category="gateway_internal",
+                        account_failure=False,
+                    )
+                raise
+            finally:
+                # A failed ASGI send can leave the generator suspended at a
+                # yield, bypassing both its finally and Starlette's background.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await self.body_iterator.aclose()
+                    finally:
+                        await cleanup()
+
+    return ClosingStreamingResponse(
         body(),
         media_type="text/event-stream",
         headers=headers,

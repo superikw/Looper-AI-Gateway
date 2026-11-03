@@ -486,3 +486,146 @@ async def test_live_sessions_and_recently_finished_requests(
     assert (
         await admin_client.get("/api/sessions?recent_seconds=-1")
     ).status_code == 422
+
+
+async def test_identity_fallback_and_upstream_in_logs(admin_client, key):
+    from app.models import UpstreamCredential
+
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        account = UpstreamCredential(
+            provider="codex",
+            name="我的备注",
+            upstream_email="owner@example.com",
+            upstream_name="Owner",
+            account_id="account-id",
+            access_token="secret",
+        )
+        db.add(account)
+        await db.flush()
+        cid = account.id
+        db.add(
+            UsageLog(
+                api_key_id=key.id,
+                user_id=key.user_id,
+                path="/v1/responses",
+                model="gpt-test",
+                status_code=200,
+                upstream_credential_id=cid,
+            )
+        )
+        db.add(
+            UsageLog(
+                api_key_id=key.id,
+                user_id=key.user_id,
+                path="/v1/responses",
+                status_code=429,
+            )
+        )
+        await db.commit()
+    pool = (await admin_client.get("/api/upstreams")).json()["accounts"]
+    assert pool[0]["display_name"] == "我的备注"
+    response = await admin_client.patch(f"/api/upstreams/{cid}", json={"name": ""})
+    assert response.status_code == 200, response.text
+    assert (await admin_client.get("/api/upstreams")).json()["accounts"][0][
+        "display_name"
+    ] == "owner@example.com"
+    logs = (await admin_client.get("/api/logs")).json()
+    routed = next(log for log in logs if log["upstream_credential_id"] == cid)
+    assert routed["upstream_display_name"] == "owner@example.com"
+    assert routed["upstream_account_id"] == "account-id"
+    assert logs[0]["upstream_display_name"] is None
+    await admin_client.delete(f"/api/upstreams/{cid}")
+    assert len((await admin_client.get("/api/logs")).json()) == 2
+
+
+async def test_user_limit_settings(admin_client, key):
+    await sign_in(admin_client)
+    users = (await admin_client.get("/api/users")).json()
+    assert users[0]["max_concurrency"] == 2
+    response = await admin_client.patch(
+        f"/api/users/{key.user_id}/limits",
+        json={"max_rpm": 10, "min_interval_seconds": 0.5},
+    )
+    assert response.status_code == 200
+    user = (await admin_client.get("/api/users")).json()[0]
+    assert (
+        user["max_rpm"] == 10
+        and user["max_concurrency"] == 2
+        and user["min_interval_seconds"] == 0.5
+    )
+    assert (
+        await admin_client.patch(
+            f"/api/users/{key.user_id}/limits", json={"max_concurrency": 0}
+        )
+    ).status_code == 422
+
+
+async def test_oauth_saves_optional_upstream_identity(
+    admin_client, monkeypatch, make_jwt
+):
+    await sign_in(admin_client)
+
+    async def exchange(*args):
+        return {
+            "access_token": "opaque-access",
+            "refresh_token": "opaque-refresh",
+            "account_id": "identity-account",
+            "id_token": make_jwt(
+                {"email": "identity@example.com", "name": "Identity Name"}
+            ),
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr("app.oauth_manual.exchange_code_for_token", exchange)
+    start = (await admin_client.post("/api/upstreams/oauth/start")).json()
+    completed = await admin_client.post(
+        "/api/upstreams/oauth/complete",
+        json={
+            "session_id": start["session_id"],
+            "callback_url": f"http://localhost:1455/auth/callback?code=x&state={start['state']}",
+        },
+    )
+    assert completed.status_code == 200, completed.text
+    account = (await admin_client.get("/api/upstreams")).json()["accounts"][0]
+    assert account["upstream_email"] == "identity@example.com"
+    assert account["upstream_name"] == "Identity Name"
+    assert account["display_name"] == "identity@example.com"
+
+
+async def test_admin_can_read_attempt_chain_and_old_logs_still_work(admin_client, key):
+    from app.models import UpstreamAttempt
+
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        log = UsageLog(
+            user_id=key.user_id,
+            api_key_id=key.id,
+            path="/v1/responses",
+            status_code=502,
+            gateway_request_id="gw_test",
+        )
+        old = UsageLog(
+            user_id=key.user_id,
+            api_key_id=key.id,
+            path="/v1/responses",
+            status_code=200,
+        )
+        db.add_all([log, old])
+        await db.flush()
+        log_id, old_id = log.id, old.id
+        db.add(
+            UpstreamAttempt(
+                gateway_request_id="gw_test",
+                attempt=1,
+                path="/v1/responses",
+                upstream_http_status=200,
+                failure_category="sse_business",
+                retry_decision="return_error",
+                elapsed_ms=10,
+            )
+        )
+        await db.commit()
+    rows = (await admin_client.get(f"/api/logs/{log_id}/attempts")).json()
+    assert len(rows) == 1 and rows[0]["failure_category"] == "sse_business"
+    assert (await admin_client.get(f"/api/logs/{old_id}/attempts")).json() == []

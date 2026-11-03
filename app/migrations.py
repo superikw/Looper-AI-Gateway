@@ -83,6 +83,15 @@ async def initialize_database() -> None:
         user_columns = await conn.run_sync(
             lambda c: {col["name"] for col in inspect(c).get_columns("users")}
         )
+        for field, definition in {
+            "max_concurrency": "INTEGER NOT NULL DEFAULT 2",
+            "max_rpm": "INTEGER NOT NULL DEFAULT 0",
+            "min_interval_seconds": "FLOAT NOT NULL DEFAULT 0",
+        }.items():
+            if field not in user_columns:
+                await conn.execute(
+                    text(f"ALTER TABLE users ADD COLUMN {field} {definition}")
+                )
         if "routing_configured" not in user_columns:
             await conn.execute(
                 text(
@@ -105,6 +114,8 @@ async def initialize_database() -> None:
                 text("ALTER TABLE upstream_credentials ADD COLUMN deleted_at DATETIME")
             )
         additions = {
+            "upstream_email": "VARCHAR(255)",
+            "upstream_name": "VARCHAR(255)",
             "name": "VARCHAR(128)",
             "enabled": "BOOLEAN NOT NULL DEFAULT 1",
             "max_rpm": "INTEGER NOT NULL DEFAULT 30",
@@ -138,6 +149,15 @@ async def initialize_database() -> None:
                 )
         usage_columns = await conn.run_sync(
             lambda c: {col["name"] for col in inspect(c).get_columns("usage_logs")}
+        )
+        if "gateway_request_id" not in usage_columns:
+            await conn.execute(
+                text("ALTER TABLE usage_logs ADD COLUMN gateway_request_id VARCHAR(64)")
+            )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_usage_logs_gateway_request_id ON usage_logs (gateway_request_id)"
+            )
         )
         if "cost_usd" not in usage_columns:
             await conn.execute(

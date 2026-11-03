@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import anyio
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -16,10 +17,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.activity import finish_active_session, start_active_session
 from app.admin_auth_schemas import LoginStartResponse
+from app.attempts import RequestTraceMiddleware, current_trace, internal_error
 from app.auth import require_admin, require_api_key
 from app.codex_auth import codex_auth_manager
 from app.config import settings
 from app.db import engine, get_db
+from app.downstream_limits import DownstreamLimitsMiddleware
 from app.http_client import close_http_client
 from app.migrations import initialize_database
 from app.model_policy import (
@@ -77,6 +80,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app.add_middleware(DownstreamLimitsMiddleware)
+app.add_middleware(RequestTraceMiddleware)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -94,6 +99,16 @@ async def http_error(request: Request, exc: StarletteHTTPException):
         error["details"] = exc.detail
     return JSONResponse(
         {"error": error}, status_code=exc.status_code, headers=exc.headers
+    )
+
+
+@app.exception_handler(Exception)
+async def unexpected_error(request: Request, exc: Exception):
+    rid = request.scope.get("gateway_request_id")
+    return JSONResponse(
+        {"error": {"message": "gateway internal error", "type": "gateway_error"}},
+        status_code=500,
+        headers={"x-gateway-request-id": rid} if rid else {},
     )
 
 
@@ -478,6 +493,35 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
             {"error": {"message": str(exc.detail)}},
             None,
             getattr(exc, "upstream_credential_id", None),
+        )
+        raise
+    except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            if "active_id" in locals():
+                await finish_active_session(active_id, "cancelled")
+            await record_usage(
+                db,
+                api_key,
+                path,
+                model,
+                499,
+                {"error": {"message": "client disconnected"}},
+                None,
+            )
+        raise
+    except Exception as exc:
+        trace = current_trace.get()
+        internal_error(exc, trace.id if trace else "unknown")
+        if "active_id" in locals():
+            await finish_active_session(active_id, "failed")
+        await record_usage(
+            db,
+            api_key,
+            path,
+            model,
+            500,
+            {"error": {"message": "gateway internal error"}},
+            None,
         )
         raise
     await finish_active_session(

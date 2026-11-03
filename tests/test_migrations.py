@@ -276,3 +276,59 @@ async def test_route_upgrade_preserves_pool_once():
     async with AsyncSessionLocal() as db:
         routes = (await db.scalars(select(UserUpstreamRoute))).all()
         assert [(r.user_id, r.upstream_credential_id) for r in routes] == [(uid, cid)]
+
+
+async def test_upgrade_adds_user_limits_and_optional_upstream_identity(key):
+    from app.db import AsyncSessionLocal
+    from app.models import User
+
+    async with engine.begin() as conn:
+        for field in ("max_concurrency", "max_rpm", "min_interval_seconds"):
+            await conn.execute(text(f"ALTER TABLE users DROP COLUMN {field}"))
+        for field in ("upstream_email", "upstream_name"):
+            await conn.execute(
+                text(f"ALTER TABLE upstream_credentials DROP COLUMN {field}")
+            )
+    await initialize_database()
+    await initialize_database()
+    async with AsyncSessionLocal() as db:
+        user = await db.get(User, key.user_id)
+        assert user.max_concurrency == 2
+        assert user.max_rpm == 0
+        assert user.min_interval_seconds == 0
+    async with engine.connect() as conn:
+        # These fields can stay NULL if the upstream did not supply identity.
+        await conn.execute(
+            text("SELECT upstream_email, upstream_name FROM upstream_credentials")
+        )
+
+
+async def test_upgrade_adds_request_ids_without_changing_historical_usage(key):
+    from app.db import AsyncSessionLocal
+    from app.models import UsageLog
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("DROP INDEX IF EXISTS ix_usage_logs_gateway_request_id")
+        )
+        await conn.execute(
+            text("ALTER TABLE usage_logs DROP COLUMN gateway_request_id")
+        )
+        await conn.execute(text("DROP TABLE upstream_attempts"))
+        await conn.execute(
+            text(
+                "INSERT INTO usage_logs (api_key_id,user_id,path,status_code,prompt_tokens,completion_tokens,total_tokens,cost_usd,created_at) VALUES (:key,:user,'/v1/responses',200,4,3,7,0.25,CURRENT_TIMESTAMP)"
+            ),
+            {"key": key.id, "user": key.user_id},
+        )
+    await initialize_database()
+    await initialize_database()
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy import select
+
+        row = await db.scalar(select(UsageLog))
+        assert (
+            row.gateway_request_id is None
+            and row.total_tokens == 7
+            and row.cost_usd == 0.25
+        )

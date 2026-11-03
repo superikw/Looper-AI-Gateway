@@ -27,6 +27,12 @@ class User(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=2, server_default="2")
+    max_rpm: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    min_interval_seconds: Mapped[float] = mapped_column(
+        Float, default=0, server_default="0"
+    )
+
     routing_configured: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1"
     )
@@ -72,6 +78,9 @@ class UsageLog(Base):
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    gateway_request_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     upstream_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     cost_usd: Mapped[float] = mapped_column(Float, default=0, server_default="0")
@@ -182,6 +191,8 @@ class UpstreamCredential(Base):
         Integer, default=0, server_default="0"
     )
     total_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    upstream_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    upstream_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     access_token: Mapped[str] = mapped_column(EncryptedText())
     refresh_token: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     token_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -212,3 +223,32 @@ class UserUpstreamRoute(Base):
     upstream_credential_id: Mapped[int] = mapped_column(
         ForeignKey("upstream_credentials.id"), primary_key=True, index=True
     )
+
+
+class UserRequest(Base):
+    __tablename__ = "user_requests"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class UpstreamAttempt(Base):
+    __tablename__ = "upstream_attempts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    gateway_request_id: Mapped[str] = mapped_column(String(64), index=True)
+    attempt: Mapped[int] = mapped_column(Integer)
+    upstream_credential_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    path: Mapped[str] = mapped_column(String(128))
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    upstream_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upstream_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    failure_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    upstream_error_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    upstream_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    transport_exception_type: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    retry_decision: Mapped[str] = mapped_column(String(64))
+    elapsed_ms: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

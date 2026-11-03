@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import math
 import re
@@ -14,6 +15,13 @@ from fastapi import HTTPException, Request
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.attempts import (
+    RequestTrace,
+    current_trace,
+    finish_response,
+    result_category,
+    safe_identifier,
+)
 from app.codex_auth import CodexAuthError, codex_auth_manager
 from app.config import settings
 from app.db import AsyncSessionLocal
@@ -31,6 +39,7 @@ from app.protocol import (
     response_failed,
     validate_upstream_data,
 )
+from app.sse_preview import Preview, retryable_failure
 from app.token_utils import extract_account_id_from_token
 from app.upstreams import AccountLease, mark_account_failure, wait_for_account
 
@@ -80,11 +89,19 @@ async def resolve_upstream_bearer_token(db: AsyncSession | None = None) -> str:
 
 def network_error(exc: httpx.RequestError) -> HTTPException:
     error = proxy_transport_error(exc)
-    if error is not None:
-        return error
-    if isinstance(exc, httpx.TimeoutException):
-        return HTTPException(504, "upstream request timed out")
-    return HTTPException(502, "upstream connection failed")
+    if error is None:
+        error = (
+            HTTPException(504, "upstream request timed out")
+            if isinstance(exc, httpx.TimeoutException)
+            else HTTPException(502, "upstream connection failed")
+        )
+    error.failure_category = (
+        "proxy_transport"
+        if isinstance(error, ProxyTransportError)
+        else "network_transport"
+    )
+    error.transport_exception_type = type(exc).__name__
+    return error
 
 
 def account_id_for_response(response: httpx.Response) -> int | None:
@@ -110,7 +127,12 @@ async def close_upstream(response: httpx.Response) -> None:
     # Cached/mock responses may already be closed before the lease is attached.
     with anyio.CancelScope(shield=True):
         try:
-            await response.aclose()
+            preview = response.extensions.get("gateway_preview")
+            try:
+                if preview is not None:
+                    await preview.close()
+            finally:
+                await response.aclose()
         finally:
             lease = response.extensions.get("gateway_account_lease")
             if lease is not None:
@@ -138,14 +160,13 @@ def cooldown_for_response(response: httpx.Response) -> int:
 
 
 def should_cooldown_for_result(result: dict[str, Any]) -> bool:
-    """Return whether a semantic upstream failure is attributable to an account.
+    """Preserve account cooldown rules without treating overload as a ban.
 
-    The Codex backend can return HTTP 200 and report shared model capacity
-    failures in the response body. Cooling the selected account for those
-    failures removes healthy accounts from the pool and turns a model-level
-    outage into a gateway-wide 503. Keep account cooldowns for other semantic
-    failures (for example malformed or account-specific responses).
+    Overload can differ by account/model. Its bounded model health policy is a
+    separate concern; absence of an account ban does not imply global failure.
     """
+    if retryable_failure(result):
+        return False
     error = result.get("error") if isinstance(result, dict) else None
     if not isinstance(error, dict):
         return True
@@ -234,6 +255,7 @@ async def open_upstream(
             request_headers=request_headers,
         )
 
+    trace = current_trace.get() or RequestTrace()
     if settings.upstream_auth_mode != "oauth_manual":
         if db is not None and db.info.get("route_user_id") is not None:
             raise HTTPException(503, "user account routing requires oauth_manual mode")
@@ -245,10 +267,17 @@ async def open_upstream(
             raise HTTPException(
                 502, "upstream credential does not contain a ChatGPT account ID"
             )
+        diagnostic = trace.begin(None, path, payload.get("model"))
         try:
-            return await send(bearer, account)
+            response = await send(bearer, account)
+            diagnostic.http_status = response.status_code
+            diagnostic.request_id = request_id(response)
+            response.extensions["gateway_attempt"] = diagnostic
+            return response
         except httpx.RequestError as exc:
-            raise network_error(exc) from None
+            error = network_error(exc)
+            diagnostic.finish(error.failure_category, "return_error", exc=error)
+            raise error from None
     if db is None:
         raise HTTPException(500, "database session required for oauth_manual mode")
     excluded: set[int] = set()
@@ -266,14 +295,25 @@ async def open_upstream(
                 upstream_credential_id, excluded, deadline, db.info.get("route_user_id")
             )
         except TimeoutError:
+            if last_response is not None:
+                return last_response
+            trace.begin(None, path, payload.get("model")).finish(
+                "local_capacity", "reject"
+            )
             raise HTTPException(503, "upstream account scheduler is busy") from None
         except HTTPException as exc:
+            if last_response is not None:
+                return last_response
+            trace.begin(None, path, payload.get("model")).finish(
+                "local_capacity", "reject", exc=exc
+            )
             if upstream_credential_id is not None:
                 exc.upstream_credential_id = upstream_credential_id
             raise
         if lease is None:
             break
         cid = lease.credential_id
+        diagnostic = trace.begin(cid, path, payload.get("model"))
         excluded.add(cid)
         response = None
         handed_off = False
@@ -297,11 +337,13 @@ async def open_upstream(
                             "upstream credential does not contain a ChatGPT account ID",
                         )
             except ProxyTransportError as exc:
+                diagnostic.finish("proxy_transport", "return_error", exc=exc)
                 exc.upstream_credential_id = cid
                 raise
             except HTTPException as exc:
                 exc.upstream_credential_id = cid
                 last_error = exc
+                diagnostic.finish("upstream_http", "retry_next_account", exc=exc)
                 await mark_account_failure(
                     cid,
                     300
@@ -314,6 +356,7 @@ async def open_upstream(
             except HTTPException as exc:
                 exc.upstream_credential_id = cid
                 last_error = exc
+                diagnostic.finish("local_capacity", "return_error", exc=exc)
                 continue
             try:
                 response = await send(bearer, account)
@@ -321,25 +364,69 @@ async def open_upstream(
                 error = network_error(exc)
                 error.upstream_credential_id = cid
                 if isinstance(error, ProxyTransportError):
+                    diagnostic.finish("proxy_transport", "return_error", exc=error)
                     raise error from None
-                await mark_account_failure(
-                    cid, settings.upstream_failure_cooldown_seconds
-                )
                 # Read/write failures may occur after the model received input.
                 if isinstance(
                     exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
                 ):
+                    diagnostic.finish(
+                        "network_transport", "retry_next_account", exc=error
+                    )
                     last_error = error
                     continue
+                diagnostic.finish("network_transport", "return_error", exc=error)
                 raise error from None
+            diagnostic.http_status = response.status_code
+            diagnostic.request_id = request_id(response)
+            response.extensions["gateway_attempt"] = diagnostic
             response.extensions["gateway_credential_id"] = cid
             response.extensions["gateway_account_lease"] = lease
             response.stream = LeasedStream(response.stream, lease)
             if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
-                handed_off = True
-                return response
-            await mark_account_failure(cid, cooldown_for_response(response))
-            if attempt == attempts - 1:
+                if (
+                    settings.sse_early_retry
+                    and raw_body is None
+                    and path in ("/v1/responses", "/v1/chat/completions")
+                    and response.status_code == 200
+                    and "text/event-stream" in response.headers.get("content-type", "")
+                ):
+                    preview = Preview(response)
+                    response.extensions["gateway_preview"] = preview
+                    failure = await preview.scan(
+                        settings.sse_preview_max_events,
+                        settings.sse_preview_max_bytes,
+                        settings.sse_preview_max_seconds,
+                    )
+                    if failure is not None and attempt < attempts - 1:
+                        diagnostic.request_id = (
+                            diagnostic.request_id or upstream_request_id(failure)
+                        )
+                        diagnostic.finish(
+                            "sse_business", "retry_next_account", result=failure
+                        )
+                        # A buffered error snapshot survives closing the old socket.
+                        last_response = httpx.Response(
+                            200,
+                            headers={
+                                "content-type": "application/json",
+                                **(
+                                    {
+                                        "x-request-id": safe_identifier(
+                                            diagnostic.request_id
+                                        )
+                                    }
+                                    if safe_identifier(diagnostic.request_id)
+                                    else {}
+                                ),
+                            },
+                            json=failure,
+                            extensions={
+                                "gateway_credential_id": cid,
+                                "gateway_attempt": diagnostic,
+                            },
+                        )
+                        continue
                 handed_off = True
                 return response
             try:
@@ -347,8 +434,50 @@ async def open_upstream(
             except httpx.RequestError as exc:
                 error = network_error(exc)
                 error.upstream_credential_id = cid
+                diagnostic.finish(error.failure_category, "return_error", exc=error)
                 raise error from None
+            try:
+                error_result = response.json()
+            except ValueError:
+                error_result = {}
+            if not isinstance(error_result, dict):
+                error_result = {}
+            diagnostic.request_id = diagnostic.request_id or upstream_request_id(
+                error_result
+            )
+            # Overload is model/business pressure, not a long account ban.
+            if response.status_code in (401, 403) or should_cooldown_for_result(
+                error_result
+            ):
+                await mark_account_failure(cid, cooldown_for_response(response))
+            diagnostic.finish(
+                "upstream_http",
+                "retry_next_account" if attempt < attempts - 1 else "return_error",
+                result=error_result,
+            )
+            if attempt == attempts - 1:
+                handed_off = True
+                return response
             last_response = response
+        except httpx.RequestError as exc:
+            error = network_error(exc)
+            error.upstream_credential_id = cid
+            diagnostic.finish(error.failure_category, "return_error", exc=error)
+            raise error from None
+        except asyncio.CancelledError:
+            diagnostic.finish("client_cancelled", "aborted")
+            raise
+        except HTTPException as exc:
+            diagnostic.finish(
+                getattr(exc, "failure_category", "sse_protocol"),
+                "return_error",
+                exc=exc,
+            )
+            exc.upstream_credential_id = cid
+            raise
+        except Exception:
+            diagnostic.finish("gateway_internal", "aborted")
+            raise
         finally:
             if not handed_off:
                 if response is not None:
@@ -399,7 +528,22 @@ def upstream_request_id(data: dict[str, Any]) -> str | None:
 async def iter_upstream_events(response: httpx.Response):
     lines = []
     try:
-        async for line in response.aiter_lines():
+        preview = response.extensions.get("gateway_preview")
+
+        async def preview_lines():
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            buffer = ""
+            async for chunk in preview.replay():
+                buffer += decoder.decode(chunk)
+                while (match := re.search(r"\r\n|\r(?!$)|\n", buffer)) is not None:
+                    yield buffer[: match.start()]
+                    buffer = buffer[match.end() :]
+            buffer += decoder.decode(b"", final=True)
+            for line in buffer.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                yield line
+
+        source = preview_lines() if preview is not None else response.aiter_lines()
+        async for line in source:
             if not line:
                 event = decode_sse_data(lines)
                 lines = []
@@ -494,6 +638,10 @@ async def forward_to_upstream(
     try:
         data = await read_upstream_data(response, path)
         code, result = format_upstream_result(path, payload, response.status_code, data)
+        attempt = response.extensions.get("gateway_attempt")
+        if attempt:
+            attempt.request_id = attempt.request_id or upstream_request_id(data)
+        finish_response(response, result_category(response, data), result=result)
         if (
             code >= 400
             and response.status_code < 400
@@ -502,8 +650,15 @@ async def forward_to_upstream(
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
         return code, result, request_id(response) or upstream_request_id(data), cid
     except HTTPException as exc:
+        finish_response(
+            response, getattr(exc, "failure_category", "sse_protocol"), exc=exc
+        )
         exc.upstream_credential_id = cid
-        if response.status_code < 400 and not isinstance(exc, ProxyTransportError):
+        if (
+            response.status_code < 400
+            and not isinstance(exc, ProxyTransportError)
+            and not getattr(exc, "transport_exception_type", None)
+        ):
             await mark_account_failure(cid, settings.upstream_failure_cooldown_seconds)
         raise
     finally:
@@ -535,7 +690,12 @@ async def forward_raw_to_upstream(
         try:
             await response.aread()
         except httpx.RequestError as exc:
-            raise network_error(exc) from None
+            error = network_error(exc)
+            finish_response(response, error.failure_category, exc=error)
+            raise error from None
+        finish_response(
+            response, "upstream_http" if response.status_code >= 400 else None
+        )
         return (
             response.status_code,
             response.content,
@@ -625,6 +785,7 @@ async def record_usage(
         UsageLog(
             api_key_id=api_key.id,
             user_id=api_key.user_id,
+            gateway_request_id=current_trace.get().id if current_trace.get() else None,
             path=path,
             model=model,
             status_code=status_code,

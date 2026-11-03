@@ -86,7 +86,7 @@ async def patch_account(
     cid: int, payload: UpstreamAccountUpdate, db: AsyncSession = Depends(get_db)
 ):
     changes = payload.model_dump(exclude_unset=True)
-    if any(value is None for value in changes.values()):
+    if any(value is None for key, value in changes.items() if key != "name"):
         raise HTTPException(400, "account fields cannot be null")
     await update_account(db, cid, changes)
     return {"ok": True}

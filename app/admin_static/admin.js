@@ -73,7 +73,7 @@ async function render() {
   } else if (page === '/users') {
     const [users,pool] = await Promise.all([api('/api/users'),api('/api/upstreams')]);
     window.viewUsers = users; window.viewAccounts = pool.accounts;
-    html = `<div class="toolbar">${button('create-user','创建用户并生成 API Key')}</div><p class="muted">可分配多个上游账户。未分配的用户无法发起上游请求。</p>${table(['用户','创建时间','状态','API Key','今日用量','上游账户','操作'],users.map(u=>`<tr><td>${esc(u.name)}</td><td>${date(u.created_at)}</td><td>${u.enabled?'启用':'停用'}</td><td>${u.keys.map(k=>esc(k.preview)).join('<br>')}</td><td>${u.usage.day.requests} 请求<br>${u.usage.day.tokens} tokens<br>${money(u.usage.day.cost_usd)}</td><td>${u.upstream_ids.map(id=>esc(pool.accounts.find(a=>a.id===id)?.name || '#'+id)).join('<br>') || '未分配'}</td><td>${button('user-routes','分配上游',u.id)}${button('delete-user','删除',u.id)}</td></tr>`))}`;
+    html = `<div class="toolbar">${button('create-user','创建用户并生成 API Key')}</div><p class="muted">可分配多个上游账户。未分配的用户无法发起上游请求。</p>${table(['用户','创建时间','状态','API Key','今日用量','上游账户','请求限制','操作'],users.map(u=>`<tr><td>${esc(u.name)}</td><td>${date(u.created_at)}</td><td>${u.enabled?'启用':'停用'}</td><td>${u.keys.map(k=>esc(k.preview)).join('<br>')}</td><td>${u.usage.day.requests} 请求<br>${u.usage.day.tokens} tokens<br>${money(u.usage.day.cost_usd)}</td><td>${u.upstream_ids.map(id=>esc(pool.accounts.find(a=>a.id===id)?.display_name || '#'+id)).join('<br>') || '未分配'}</td><td>并发 ${u.max_concurrency}<br>RPM ${u.max_rpm || '不限'}<br>间隔 ${u.min_interval_seconds}s</td><td>${button('user-limits','请求限制',u.id)}${button('user-routes','分配上游',u.id)}${button('delete-user','删除',u.id)}</td></tr>`))}`;
   } else if (page === '/logs') {
     const logs = await api(`/api/logs?limit=50&offset=${offset}`);
     html = `<div class="toolbar">${button('refresh','刷新')}${me.is_superadmin?button('clear-logs','清理过期日志'):''}</div>${logTable(logs)}<div class="pager">${offset?button('previous','上一页'):''}<span>第 ${offset/50+1} 页</span>${logs.length===50?button('next','下一页'):''}</div>`;
@@ -86,13 +86,13 @@ async function render() {
   } else if (page === '/upstreams') {
     const [pool,users] = await Promise.all([api('/api/upstreams'),api('/api/users')]);
     window.viewAccounts = pool.accounts; window.viewUsers = users;
-    html = `<div class="toolbar">${button('oauth','添加上游账户（OAuth）')}${button('refresh','刷新列表')}</div><p class="muted">认证模式：${esc(pool.auth_mode)}。新账户默认无用户路由；分配后参与调度。会话数为当前账户的进行中请求数，用量额度需要手动刷新。</p><div class="grid">${pool.accounts.map(a=>`<section class="card"><h2>${esc(a.name || '账户 #'+a.id)} <span class="badge">${esc(a.status)}</span></h2><p>账户 ID：${esc(a.account_id || '未知')}<br>凭证过期：${date(a.expires_at)}<br>冷却重置：${date(a.cooldown_until)}<br>最近使用：${date(a.last_used_at)}</p><p>${a.request_count} 请求 · ${a.failure_count} 失败<br>${a.total_tokens} tokens · ${a.active_sessions} 活动会话<br>RPM ${a.max_rpm} · 并发 ${a.max_concurrency} · 最小间隔 ${a.min_interval_seconds}s</p>${quotaHTML(a.quota)}<p>路由用户：${a.user_ids.map(id=>esc(users.find(u=>u.id===id)?.name || '#'+id)).join('、') || '未分配'}</p><div class="toolbar">${button('account-routes','分配用户',a.id)}${button('account-edit','维护',a.id)}${button('quota','刷新额度',a.id)}${button('account-toggle',a.enabled?'停用':'启用',a.id)}${button('account-delete','删除',a.id)}</div></section>`).join('') || '<p>暂无上游账户，请添加。</p>'}</div>`;
+    html = `<div class="toolbar">${button('oauth','添加上游账户（OAuth）')}${button('refresh','刷新列表')}</div><p class="muted">认证模式：${esc(pool.auth_mode)}。新账户默认无用户路由；分配后参与调度。会话数为当前账户的进行中请求数，用量额度需要手动刷新。</p><div class="grid">${pool.accounts.map(a=>`<section class="card"><h2>${esc(a.display_name || a.account_id || '账户 #'+a.id)} <span class="badge">${esc(a.status)}</span></h2><p>账户 ID：${esc(a.account_id || '未知')}<br>凭证过期：${date(a.expires_at)}<br>冷却重置：${date(a.cooldown_until)}<br>最近使用：${date(a.last_used_at)}</p><p>${a.request_count} 请求 · ${a.failure_count} 失败<br>${a.total_tokens} tokens · ${a.active_sessions} 活动会话<br>RPM ${a.max_rpm} · 并发 ${a.max_concurrency} · 最小间隔 ${a.min_interval_seconds}s</p>${quotaHTML(a.quota)}<p>路由用户：${a.user_ids.map(id=>esc(users.find(u=>u.id===id)?.name || '#'+id)).join('、') || '未分配'}</p><div class="toolbar">${button('account-routes','分配用户',a.id)}${button('account-edit','维护',a.id)}${button('quota','刷新额度',a.id)}${button('account-toggle',a.enabled?'停用':'启用',a.id)}${button('account-delete','删除',a.id)}</div></section>`).join('') || '<p>暂无上游账户，请添加。</p>'}</div>`;
   }
   if (current !== generation || !me) return;
   shell(); document.querySelector('#content').innerHTML = html;
 }
 function logTable(logs) {
-  return table(['时间','用户 / Key','接口','模型','状态','输入 / 输出','Tokens','费用','错误'],logs.map(x=>`<tr><td>${date(x.created_at)}</td><td>${esc(x.user)}<br><small>${esc(x.key)}</small></td><td>${interfaceHTML(x.path)}</td><td>${esc(x.model)}</td><td>${x.status_code}</td><td>${x.input_tokens} / ${x.output_tokens}</td><td>${x.total_tokens}</td><td>${money(x.cost_usd)}</td><td class="error">${esc(x.error)}</td></tr>`));
+  return table(['时间','用户 / Key','接口','上游账户','模型','状态','输入 / 输出','Tokens','费用','错误','尝试链路'],logs.map(x=>`<tr><td>${date(x.created_at)}</td><td>${esc(x.user)}<br><small>${esc(x.key)}</small></td><td>${interfaceHTML(x.path)}</td><td>${esc(x.upstream_display_name || '—')}${x.upstream_credential_id ? `<small>本地 #${x.upstream_credential_id}</small>` : ''}</td><td>${esc(x.model)}</td><td>${x.status_code}</td><td>${x.input_tokens} / ${x.output_tokens}</td><td>${x.total_tokens}</td><td>${money(x.cost_usd)}</td><td class="error">${esc(x.error)}</td><td>${x.gateway_request_id?button('attempts','查看尝试',x.id):'—'}</td></tr>`));
 }
 function interfaceHTML(path) {
   const label = {'/v1/responses':'Responses','/v1/chat/completions':'Chat Completions'}[path];
@@ -125,13 +125,20 @@ function routeForm(kind, id) {
   const subject = (userSide?window.viewUsers:window.viewAccounts).find(x=>x.id===id);
   const choices = userSide?window.viewAccounts:window.viewUsers;
   const selected = userSide?subject.upstream_ids:subject.user_ids;
-  modal(userSide?'分配上游账户':'分配路由用户', `<p>支持多选，全部取消即无路由。</p><div class="toolbar">${button('routes-select-all','全选')}${button('routes-invert','反选')}</div>${choices.map(x=>`<label class="check"><input type="checkbox" name="ids" value="${x.id}" ${selected.includes(x.id)?'checked':''}>${esc(x.name || '#'+x.id)}</label>`).join('') || '<p>暂无可分配项。</p>'}`, data => send(userSide?`/api/users/${id}/upstreams`:`/api/upstreams/${id}/users`,'PUT',{[userSide?'upstream_ids':'user_ids']:data.getAll('ids').map(Number)}));
+  modal(userSide?'分配上游账户':'分配路由用户', `<p>支持多选，全部取消即无路由。</p><div class="toolbar">${button('routes-select-all','全选')}${button('routes-invert','反选')}</div>${choices.map(x=>`<label class="check"><input type="checkbox" name="ids" value="${x.id}" ${selected.includes(x.id)?'checked':''}>${esc(x.display_name || x.name || '#'+x.id)}</label>`).join('') || '<p>暂无可分配项。</p>'}`, data => send(userSide?`/api/users/${id}/upstreams`:`/api/upstreams/${id}/users`,'PUT',{[userSide?'upstream_ids':'user_ids']:data.getAll('ids').map(Number)}));
 }
 async function act(action, id) {
   switch(action) {
     case 'routes-select-all': case 'routes-invert':
       document.querySelectorAll('dialog[open] input[name="ids"]').forEach(input=>{input.checked=action==='routes-select-all' || !input.checked;});
       return;
+    case 'attempts': {
+      const rows=await api(`/api/logs/${id}/attempts`);
+      const dialog=document.createElement('dialog');
+      dialog.innerHTML=`<h2>请求尝试链路</h2><p>${esc(rows[0]?.gateway_request_id || '无尝试记录')}</p>${table(['次数','上游编号','HTTP','结果分类','错误类型 / 代码','传输异常类型','处理决定','耗时 ms','上游请求 ID'],rows.map(r=>`<tr><td>${r.attempt}</td><td>${esc(r.upstream_credential_id ?? '—')}</td><td>${esc(r.upstream_http_status ?? '—')}</td><td>${esc(r.failure_category || '成功')}</td><td>${esc(r.upstream_error_type)} / ${esc(r.upstream_error_code)}</td><td>${esc(r.transport_exception_type)}</td><td>${esc(r.retry_decision)}</td><td>${r.elapsed_ms}</td><td>${esc(r.upstream_request_id)}</td></tr>`))}<button type="button" data-close>关闭</button>`;
+      dialog.querySelector('[data-close]').onclick=()=>{dialog.close();dialog.remove();};
+      document.body.append(dialog);dialog.showModal();return;
+    }
     case 'password': passwordForm(); return;
     case 'logout': await send('/api/logout','POST'); me=null; showLogin(); return;
     case 'refresh': await render(); return;
@@ -144,6 +151,10 @@ async function act(action, id) {
     }); return;
     case 'delete-user': if(confirm('删除用户并撤销所有 API Key？')) await send('/api/users/'+id,'DELETE'); break;
     case 'user-routes': case 'account-routes': routeForm(action,id); return;
+    case 'user-limits': {
+      const u=window.viewUsers.find(u=>u.id===id);
+      modal('下游用户请求限制',`<p>同一用户的所有 API Key 共用限制。超限返回 429，不排队。</p><label>最大并发<input name="concurrency" type="number" min="1" max="10000" value="${u.max_concurrency}" required></label><label>每分钟请求数（0 表示不限）<input name="rpm" type="number" min="0" max="100000" value="${u.max_rpm}" required></label><label>最小请求间隔（秒）<input name="interval" type="number" min="0" max="3600" step="any" value="${u.min_interval_seconds}" required></label>`,data=>send(`/api/users/${id}/limits`,'PATCH',{max_concurrency:Number(data.get('concurrency')),max_rpm:Number(data.get('rpm')),min_interval_seconds:Number(data.get('interval'))})); return;
+    }
     case 'price': {
       const p=window.viewPrices.find(p=>p.id===id) || {};
       modal('模型价格', `<label>模型 ID<input name="model" value="${esc(p.model)}" maxlength="128" required></label>${[['input','输入',p.input_usd_per_million],['output','输出',p.output_usd_per_million],['cached','缓存读取',p.cached_input_usd_per_million]].map(([name,label,value])=>`<label>${label}（USD / 百万 tokens）<input name="${name}" type="number" min="0" step="any" value="${value??0}" required></label>`).join('')}`,data=>send('/api/prices','PUT',{model:data.get('model'),input_usd_per_million:Number(data.get('input')),output_usd_per_million:Number(data.get('output')),cached_input_usd_per_million:Number(data.get('cached')),source:'manual'})); return;
@@ -159,7 +170,7 @@ async function act(action, id) {
     }
     case 'account-edit': {
       const a=window.viewAccounts.find(a=>a.id===id);
-      modal('上游账户维护',`<label>名称<input name="name" value="${esc(a.name || '账户 #'+id)}" required maxlength="128"></label><label>每分钟请求数<input name="rpm" type="number" min="1" max="100000" value="${a.max_rpm}" required></label><label>最大并发<input name="concurrency" type="number" min="1" max="10000" value="${a.max_concurrency}" required></label><label>最小请求间隔（秒）<input name="interval" type="number" min="0" max="3600" step="any" value="${a.min_interval_seconds}" required></label><label class="check"><input name="reset" type="checkbox">清除失败冷却</label>`,data=>send('/api/upstreams/'+id,'PATCH',{name:data.get('name'),max_rpm:Number(data.get('rpm')),max_concurrency:Number(data.get('concurrency')),min_interval_seconds:Number(data.get('interval')),reset_cooldown:data.has('reset')})); return;
+      modal('上游账户维护',`<label>名称<input name="name" value="${esc(a.name || '')}" placeholder="留空使用邮箱、名称或账户 ID" maxlength="128"></label><label>每分钟请求数<input name="rpm" type="number" min="1" max="100000" value="${a.max_rpm}" required></label><label>最大并发<input name="concurrency" type="number" min="1" max="10000" value="${a.max_concurrency}" required></label><label>最小请求间隔（秒）<input name="interval" type="number" min="0" max="3600" step="any" value="${a.min_interval_seconds}" required></label><label class="check"><input name="reset" type="checkbox">清除失败冷却</label>`,data=>send('/api/upstreams/'+id,'PATCH',{name:data.get('name'),max_rpm:Number(data.get('rpm')),max_concurrency:Number(data.get('concurrency')),min_interval_seconds:Number(data.get('interval')),reset_cooldown:data.has('reset')})); return;
     }
     case 'account-toggle': await send('/api/upstreams/'+id,'PATCH',{enabled:!window.viewAccounts.find(a=>a.id===id).enabled}); break;
     case 'account-delete': if(confirm('删除上游账户并移除路由？已开始的请求会继续完成。')) await send('/api/upstreams/'+id,'DELETE'); break;

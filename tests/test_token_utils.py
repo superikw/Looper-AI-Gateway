@@ -38,3 +38,24 @@ def test_account_claim_and_oauth_response_precedence(make_jwt):
     )
     assert extract_account_id(token, {"account_id": 42}) == "claim-account"
     assert extract_account_id("opaque-token", {"sub": "user-subject"}) is None
+
+
+def test_optional_identity_and_display_order(make_jwt):
+    from app.token_utils import account_display_name, extract_identity
+
+    identity = extract_identity(
+        {"id_token": make_jwt({"email": "user@example.com", "name": "Display Name"})}
+    )
+    assert identity == {
+        "upstream_email": "user@example.com",
+        "upstream_name": "Display Name",
+    }
+    assert extract_identity({"access_token": "opaque"}) == {
+        "upstream_email": None,
+        "upstream_name": None,
+    }
+    assert account_display_name("remark", "email", "name", "id", 1) == "remark"
+    assert account_display_name("  ", "email", "name", "id", 1) == "email"
+    assert account_display_name(None, None, "name", "id", 1) == "name"
+    assert account_display_name(None, None, None, "id", 1) == "id"
+    assert account_display_name(None, None, None, None, 1) == "账户 #1"

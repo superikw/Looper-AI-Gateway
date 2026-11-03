@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +30,7 @@ async def require_admin(authorization: str | None = Header(default=None)) -> Non
 
 
 async def require_api_key(
+    request: Request,
     authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> ApiKey:
@@ -60,4 +61,22 @@ async def require_api_key(
     # APIs and the upgrade migration opt users into explicit route assignment.
     if user.routing_configured:
         db.info["route_user_id"] = api_key.user_id
+    from app.downstream_limits import claim_user
+
+    try:
+        request.scope["downstream_lease"] = await claim_user(api_key.user_id)
+    except HTTPException as exc:
+        if exc.status_code == 429:
+            from app.services import record_usage
+
+            await record_usage(
+                db,
+                api_key,
+                request.url.path,
+                None,
+                429,
+                {"error": {"message": str(exc.detail)}},
+                None,
+            )
+        raise
     return api_key
