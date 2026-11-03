@@ -399,7 +399,7 @@ docker compose exec looper-ai-gateway python manage.py list-upstreams --include-
 
 ### 独立管理后台
 
-Compose 会额外启动 `looper-ai-admin`，默认映射到宿主机 `127.0.0.1:34568`，不会占用 API 的 34567 端口。首次部署后在服务器本地设置超级管理员：
+Compose 会额外启动 `looper-ai-admin`，默认映射到宿主机 `0.0.0.0:34568`，不会占用 API 的 34567 端口。首次部署后在服务器本地设置超级管理员：
 
 ```bash
 docker compose build looper-ai-gateway looper-ai-admin
@@ -407,7 +407,7 @@ docker compose up -d
 docker compose exec -T looper-ai-admin python manage.py set-superadmin --username root
 ```
 
-管理页面为 `http://127.0.0.1:34568/`。需要从本地电脑访问时建立 SSH 隧道：
+管理页面为 `http://服务器IP:34568/`。如果防火墙未开放管理端口，也可以建立 SSH 隧道：
 
 ```bash
 ssh -N -L 34568:127.0.0.1:34568 用户名@服务器IP
@@ -481,7 +481,7 @@ curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
 | --- | --- |
 | `ADMIN_TOKEN` | 必须手动配置的管理员随机口令，至少 32 个字符 |
 | `ADMIN_HOST_PORT` | 管理后台宿主机端口，默认 34568；Compose 端口映射使用 |
-| `ADMIN_BIND_ADDRESS` | 管理后台绑定地址，默认 127.0.0.1 |
+| `ADMIN_BIND_ADDRESS` | 管理后台绑定地址，默认 0.0.0.0 |
 | `ADMIN_PORT` | 管理容器内部端口，默认 8081 |
 | `DATABASE_URL` | 默认 `sqlite+aiosqlite:///./data/gateway.db` |
 | `CREDENTIAL_KEY_FILE` | 默认 `./data/credential.key`，首次使用自动生成，文件权限为 0600 |

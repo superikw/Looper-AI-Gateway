@@ -83,7 +83,7 @@ services:
     depends_on:
       - looper-ai-gateway
     ports:
-      - "${ADMIN_BIND_ADDRESS:-127.0.0.1}:${ADMIN_HOST_PORT:-34568}:8081"
+      - "${ADMIN_BIND_ADDRESS:-0.0.0.0}:${ADMIN_HOST_PORT:-34568}:8081"
     volumes:
       - ./data:/app/data
     command: ["python", "-m", "app.admin_server"]
