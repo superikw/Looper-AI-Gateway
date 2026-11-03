@@ -397,6 +397,28 @@ docker compose exec looper-ai-gateway python manage.py list-upstreams --include-
 
 ## 用户与用量管理
 
+### 独立管理后台
+
+Compose 会额外启动 `looper-ai-admin`，默认映射到宿主机 `127.0.0.1:34568`，不会占用 API 的 34567 端口。首次部署后在服务器本地设置超级管理员：
+
+```bash
+docker compose build looper-ai-gateway looper-ai-admin
+docker compose up -d
+docker compose exec -T looper-ai-admin python manage.py set-superadmin --username root
+```
+
+管理页面为 `http://127.0.0.1:34568/`。需要从本地电脑访问时建立 SSH 隧道：
+
+```bash
+ssh -N -L 34568:127.0.0.1:34568 用户名@服务器IP
+```
+
+超级管理员可以创建管理员。新管理员首次登录必须修改自动生成的初始密码；超级管理员重置密码会立即撤销该管理员的所有会话。普通用户创建时同时生成 API Key，明文 Key 只显示一次。
+
+后台提供按时区统计的今日、昨日、本周和本月用量、活动会话、请求日志、模型价格、日志清理以及 CPU、内存、磁盘监控。时区默认使用服务器本机时区，可在后台设置为 IANA 时区名称，例如 `Asia/Shanghai`。
+
+模型价格必须由管理员配置。`gpt-6-*` 等上游内部模型没有可核验的公开官方价格，系统不会自动猜测价格；未配置价格的请求费用显示为 `$0`，但 token 仍会记录。价格来源字段用于记录管理员采用的公开价目表或内部约定。
+
 ```bash
 docker compose exec looper-ai-gateway python manage.py list-users
 docker compose exec looper-ai-gateway python manage.py list-keys
@@ -458,10 +480,15 @@ curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
 | 配置 | 作用 |
 | --- | --- |
 | `ADMIN_TOKEN` | 必须手动配置的管理员随机口令，至少 32 个字符 |
+| `ADMIN_HOST_PORT` | 管理后台宿主机端口，默认 34568；Compose 端口映射使用 |
+| `ADMIN_BIND_ADDRESS` | 管理后台绑定地址，默认 127.0.0.1 |
+| `ADMIN_PORT` | 管理容器内部端口，默认 8081 |
 | `DATABASE_URL` | 默认 `sqlite+aiosqlite:///./data/gateway.db` |
 | `CREDENTIAL_KEY_FILE` | 默认 `./data/credential.key`，首次使用自动生成，文件权限为 0600 |
 | `CREDENTIAL_ENCRYPTION_KEY` | 可选 Fernet 密钥；设置后优先于密钥文件，升级时必须保持一致 |
 | `UPSTREAM_BASE_URL` | 默认 `https://chatgpt.com/backend-api` |
+| `TIMEZONE` | 统计默认时区；留空时使用服务器本机时区 |
+| `LOG_RETENTION_DAYS` | 请求日志保留天数，默认 7 |
 | `UPSTREAM_AUTH_MODE` | `oauth_manual`、`codex_auth_file` 或 `env_token` |
 | `WARP_IMAGE` | WARP 镜像，默认 `caomingjun/warp:latest`，可固定标签或 digest |
 | `WARP_SLEEP` | WARP 启动等待秒数，默认 5 |

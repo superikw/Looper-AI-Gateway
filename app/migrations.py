@@ -80,6 +80,13 @@ async def initialize_database() -> None:
             await conn.execute(
                 text("ALTER TABLE api_keys ADD COLUMN deleted_at DATETIME")
             )
+        user_columns = await conn.run_sync(
+            lambda c: {col["name"] for col in inspect(c).get_columns("users")}
+        )
+        if "enabled" not in user_columns:
+            await conn.execute(text("ALTER TABLE users ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1"))
+        if "deleted_at" not in user_columns:
+            await conn.execute(text("ALTER TABLE users ADD COLUMN deleted_at DATETIME"))
         credential_columns = await conn.run_sync(
             lambda c: {
                 col["name"] for col in inspect(c).get_columns("upstream_credentials")
@@ -121,6 +128,11 @@ async def initialize_database() -> None:
                         f"ALTER TABLE {table} ADD COLUMN upstream_credential_id INTEGER REFERENCES upstream_credentials(id)"
                     )
                 )
+        usage_columns = await conn.run_sync(
+            lambda c: {col["name"] for col in inspect(c).get_columns("usage_logs")}
+        )
+        if "cost_usd" not in usage_columns:
+            await conn.execute(text("ALTER TABLE usage_logs ADD COLUMN cost_usd FLOAT NOT NULL DEFAULT 0"))
         await conn.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS ix_usage_logs_upstream_credential_id ON usage_logs (upstream_credential_id)"

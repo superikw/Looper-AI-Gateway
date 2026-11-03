@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import secrets
 from pathlib import Path
@@ -12,12 +13,13 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
+from app.admin_service import hash_password
 from app.config import settings
 from app.db import AsyncSessionLocal, engine
 from app.http_client import close_http_client
 from app.migrations import initialize_database
 from app.model_policy import block_model, list_blocked_models, unblock_model
-from app.models import ApiKey, OAuthSession, UpstreamCredential, User
+from app.models import AdminAccount, ApiKey, OAuthSession, UpstreamCredential, User
 from app.oauth_manual import (
     active_upstream_credential_query,
     complete_oauth_session,
@@ -40,6 +42,26 @@ async def ensure_db() -> None:
 
 async def cmd_generate_admin_token(_: argparse.Namespace) -> None:
     print(secrets.token_hex(32))
+
+
+async def cmd_set_superadmin(args: argparse.Namespace) -> None:
+    await ensure_db()
+    password = args.password or getpass.getpass("Super administrator password: ")
+    if len(password) < 12:
+        raise SystemExit("password must contain at least 12 characters")
+    async with AsyncSessionLocal() as db:
+        admin = await db.scalar(
+            select(AdminAccount).where(AdminAccount.is_superadmin.is_(True))
+        )
+        if not admin:
+            admin = AdminAccount(username=args.username, is_superadmin=True)
+            db.add(admin)
+        admin.username = args.username
+        admin.password_hash = hash_password(password)
+        admin.must_change_password = False
+        admin.enabled = True
+        await db.commit()
+    print_json({"ok": True, "username": args.username})
 
 
 async def cmd_list_blocked_models(_: argparse.Namespace) -> None:
@@ -406,6 +428,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "generate-admin-token", help="Generate a strong ADMIN_TOKEN"
     ).set_defaults(func=cmd_generate_admin_token)
+    p = sub.add_parser("set-superadmin", help="Set the local super administrator")
+    p.add_argument("--username", required=True)
+    p.add_argument("--password")
+    p.set_defaults(func=cmd_set_superadmin)
     sub.add_parser("list-blocked-models", help="List the model blacklist").set_defaults(
         func=cmd_list_blocked_models
     )

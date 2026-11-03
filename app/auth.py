@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import get_db
-from app.models import ApiKey
+from app.models import ApiKey, User
 from app.utils import sha256_text
 
 
@@ -40,7 +40,15 @@ async def require_api_key(
 
     raw_key = authorization.removeprefix("Bearer ").strip()
     hashed = sha256_text(raw_key)
-    result = await db.execute(select(ApiKey).where(ApiKey.key_hash == hashed))
+    result = await db.execute(
+        select(ApiKey)
+        .join(User, User.id == ApiKey.user_id)
+        .where(
+            ApiKey.key_hash == hashed,
+            User.enabled.is_(True),
+            User.deleted_at.is_(None),
+        )
+    )
     api_key = result.scalar_one_or_none()
     if not api_key or not api_key.enabled or api_key.deleted_at is not None:
         raise HTTPException(

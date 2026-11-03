@@ -14,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.activity import finish_active_session, start_active_session
 from app.admin_auth_schemas import LoginStartResponse
 from app.auth import require_admin, require_api_key
 from app.codex_auth import codex_auth_manager
@@ -457,12 +458,17 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
         model = validate_model(payload["model"])
         await enforce_model_policy(db, model)
         payload["model"] = model
+        active_id = await start_active_session(
+            db, api_key.user_id, api_key.id, path, payload["model"]
+        )
         if payload.get("stream", False):
-            return await stream_to_upstream(path, payload, db, api_key)
+            return await stream_to_upstream(path, payload, db, api_key, active_id)
         status_code, data, req_id, cid = await forward_to_upstream(
             path, payload, db, api_key.upstream_credential_id
         )
     except HTTPException as exc:
+        if "active_id" in locals():
+            await finish_active_session(active_id, "failed")
         await record_usage(
             db,
             api_key,
@@ -474,6 +480,7 @@ async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSe
             getattr(exc, "upstream_credential_id", None),
         )
         raise
+    await finish_active_session(active_id, "completed" if status_code < 400 else "failed")
     await record_usage(db, api_key, path, model, status_code, data, req_id, cid)
     headers = {}
     if req_id:

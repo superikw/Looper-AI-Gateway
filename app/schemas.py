@@ -25,6 +25,8 @@ class UserOut(BaseModel):
     id: int
     name: str
     note: str | None
+    enabled: bool = True
+    deleted_at: datetime | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -61,6 +63,50 @@ class ApiKeyOut(BaseModel):
     upstream_credential_id: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AdminLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class AdminPasswordChange(BaseModel):
+    current_password: str | None = Field(default=None, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class AdminCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+
+
+class AdminOut(BaseModel):
+    id: int
+    username: str
+    is_superadmin: bool
+    must_change_password: bool
+    enabled: bool
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ModelPriceIn(BaseModel):
+    model: str = Field(min_length=1, max_length=128)
+    input_usd_per_million: float = Field(ge=0)
+    output_usd_per_million: float = Field(ge=0)
+    cached_input_usd_per_million: float = Field(default=0, ge=0)
+    source: str = Field(default="manual", max_length=255)
+
+
+class SettingUpdate(BaseModel):
+    timezone: str | None = Field(default=None, max_length=128)
+    log_retention_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class UserProvision(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    note: str | None = Field(default=None, max_length=255)
+    key_name: str = Field(default="default", min_length=1, max_length=128)
 
 
 class ApiKeyBinding(BaseModel):

@@ -67,3 +67,23 @@ services:
     # Example admin commands:
     # docker compose exec looper-ai-gateway python manage.py doctor
     # docker compose exec looper-ai-gateway python manage.py auth-start
+
+  looper-ai-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: looper-ai-admin
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      ADMIN_HOST: "0.0.0.0"
+      ADMIN_PORT: "8081"
+      PORT: "8081"
+    depends_on:
+      - looper-ai-gateway
+    ports:
+      - "${ADMIN_BIND_ADDRESS:-127.0.0.1}:${ADMIN_HOST_PORT:-34568}:8081"
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "app.admin_server"]

@@ -11,14 +11,14 @@ from typing import Any
 import anyio
 import httpx
 from fastapi import HTTPException, Request
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.codex_auth import CodexAuthError, codex_auth_manager
 from app.config import settings
 from app.db import AsyncSessionLocal
 from app.http_client import ProxyTransportError, get_http_client, proxy_transport_error
-from app.models import ApiKey, UpstreamCredential, UsageLog
+from app.models import ApiKey, ModelPrice, UpstreamCredential, UsageLog
 from app.oauth_manual import get_active_upstream_credential
 from app.protocol import (
     ResponseAccumulator,
@@ -560,6 +560,21 @@ async def record_usage(
         usage.get("completion_tokens") or usage.get("output_tokens") or 0
     )
     total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    price = await db.scalar(select(ModelPrice).where(ModelPrice.model == model)) if model else None
+    cost_usd = 0.0
+    if price:
+        details = usage.get("input_tokens_details") or {}
+        cached = int(
+            usage.get("cached_input_tokens")
+            or (details.get("cached_tokens") if isinstance(details, dict) else 0)
+            or 0
+        )
+        billable_prompt = max(prompt_tokens - cached, 0)
+        cost_usd = (
+            billable_prompt * price.input_usd_per_million
+            + cached * price.cached_input_usd_per_million
+            + completion_tokens * price.output_usd_per_million
+        ) / 1_000_000
 
     await db.execute(
         update(ApiKey)
@@ -609,6 +624,7 @@ async def record_usage(
             upstream_request_id=upstream_request_id,
             upstream_credential_id=upstream_credential_id,
             error_message=error_message,
+            cost_usd=cost_usd,
         )
     )
     await db.commit()

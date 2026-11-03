@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from app.activity import finish_active_session
 from app.config import settings
 from app.db import AsyncSessionLocal
 from app.http_client import ProxyTransportError
@@ -193,7 +194,7 @@ class ChatStream:
         return chunks
 
 
-async def stream_to_upstream(path: str, payload: dict, db, api_key):
+async def stream_to_upstream(path: str, payload: dict, db, api_key, active_id: str | None = None):
     response = await open_upstream(path, payload, db, api_key.upstream_credential_id)
     rid = request_id(response)
     cid = account_id_for_response(response)
@@ -257,6 +258,8 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                 rid or provider_request_id,
                 cid,
             )
+            if active_id:
+                await finish_active_session(active_id, "failed")
             headers = {"x-upstream-status": "200"}
             if provider_request_id:
                 headers["x-upstream-request-id"] = provider_request_id
@@ -310,6 +313,8 @@ async def stream_to_upstream(path: str, payload: dict, db, api_key):
                     upstream_rid,
                     cid,
                 )
+            if active_id:
+                await finish_active_session(active_id, "completed" if state["code"] < 400 else "failed")
 
     async def body():
         nonlocal upstream_rid

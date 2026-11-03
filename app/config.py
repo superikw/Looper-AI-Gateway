@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     app_name: str = Field(default="Looper-AI-Gateway", alias="APP_NAME")
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8080, alias="PORT")
+    admin_host: str = Field(default="0.0.0.0", alias="ADMIN_HOST")
+    admin_port: int = Field(default=8081, alias="ADMIN_PORT", gt=0, le=65535)
     admin_token: str = Field(default="", alias="ADMIN_TOKEN")
     database_url: str = Field(
         default="sqlite+aiosqlite:///./data/gateway.db", alias="DATABASE_URL"
@@ -73,6 +75,8 @@ class Settings(BaseSettings):
         default="gpt-6.1-sol",
         alias="MODEL_CATALOG",
     )
+    timezone: str = Field(default="", alias="TIMEZONE")
+    log_retention_days: int = Field(default=7, alias="LOG_RETENTION_DAYS", ge=1, le=3650)
 
     oauth_authorize_url: str = Field(
         default="https://auth.openai.com/oauth/authorize", alias="OAUTH_AUTHORIZE_URL"
