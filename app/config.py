@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     port: int = Field(default=8080, alias="PORT")
     admin_host: str = Field(default="0.0.0.0", alias="ADMIN_HOST")
     admin_port: int = Field(default=8081, alias="ADMIN_PORT", gt=0, le=65535)
+    admin_require_https: bool = Field(default=False, alias="ADMIN_REQUIRE_HTTPS")
+    admin_ssl_certfile: str = Field(default="", alias="ADMIN_SSL_CERTFILE")
+    admin_ssl_keyfile: str = Field(default="", alias="ADMIN_SSL_KEYFILE")
     admin_token: str = Field(default="", alias="ADMIN_TOKEN")
     database_url: str = Field(
         default="sqlite+aiosqlite:///./data/gateway.db", alias="DATABASE_URL"

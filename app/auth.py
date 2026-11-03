@@ -55,4 +55,9 @@ async def require_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or disabled api key",
         )
+    user = await db.get(User, api_key.user_id)
+    # Old integrations may provision database rows directly. Public creation
+    # APIs and the upgrade migration opt users into explicit route assignment.
+    if user.routing_configured:
+        db.info["route_user_id"] = api_key.user_id
     return api_key

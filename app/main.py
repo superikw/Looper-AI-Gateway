@@ -128,7 +128,7 @@ async def create_user(payload: UserCreate, db: AsyncSession = Depends(get_db)):
     existing = await db.execute(select(User).where(User.name == payload.name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="user name already exists")
-    user = User(name=payload.name, note=payload.note)
+    user = User(name=payload.name, note=payload.note, routing_configured=True)
     db.add(user)
     await db.commit()
     await db.refresh(user)

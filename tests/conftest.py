@@ -51,7 +51,9 @@ async def client():
 @pytest_asyncio.fixture
 async def key():
     async with AsyncSessionLocal() as db:
-        user = User(name="test-user")
+        # Existing proxy tests exercise the pre-upgrade shared-pool policy.
+        # Admin/routing tests explicitly opt this user into assigned routes.
+        user = User(name="test-user", routing_configured=False)
         db.add(user)
         await db.flush()
         key = ApiKey(
@@ -63,3 +65,11 @@ async def key():
         db.add(key)
         await db.commit()
         return key
+
+
+@pytest.fixture(autouse=True)
+def offline_price_catalogs(monkeypatch):
+    async def catalogs():
+        return {}, []
+
+    monkeypatch.setattr("app.pricing.catalogs", catalogs)

@@ -83,8 +83,16 @@ async def initialize_database() -> None:
         user_columns = await conn.run_sync(
             lambda c: {col["name"] for col in inspect(c).get_columns("users")}
         )
+        if "routing_configured" not in user_columns:
+            await conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN routing_configured BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
         if "enabled" not in user_columns:
-            await conn.execute(text("ALTER TABLE users ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1"))
+            await conn.execute(
+                text("ALTER TABLE users ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1")
+            )
         if "deleted_at" not in user_columns:
             await conn.execute(text("ALTER TABLE users ADD COLUMN deleted_at DATETIME"))
         credential_columns = await conn.run_sync(
@@ -132,7 +140,11 @@ async def initialize_database() -> None:
             lambda c: {col["name"] for col in inspect(c).get_columns("usage_logs")}
         )
         if "cost_usd" not in usage_columns:
-            await conn.execute(text("ALTER TABLE usage_logs ADD COLUMN cost_usd FLOAT NOT NULL DEFAULT 0"))
+            await conn.execute(
+                text(
+                    "ALTER TABLE usage_logs ADD COLUMN cost_usd FLOAT NOT NULL DEFAULT 0"
+                )
+            )
         await conn.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS ix_usage_logs_upstream_credential_id ON usage_logs (upstream_credential_id)"
@@ -144,6 +156,33 @@ async def initialize_database() -> None:
         await conn.execute(
             text("INSERT OR IGNORE INTO schema_migrations (version) VALUES (6)")
         )
+        if not (
+            await conn.execute(
+                text("SELECT version FROM schema_migrations WHERE version = 7")
+            )
+        ).first():
+            # Preserve the existing pool behavior once, at upgrade time. Future
+            # users/accounts start with no assignments and require explicit routing.
+            await conn.execute(
+                text("""
+                INSERT OR IGNORE INTO user_upstream_routes (user_id, upstream_credential_id)
+                SELECT u.id, c.id FROM users u CROSS JOIN upstream_credentials c
+                WHERE u.deleted_at IS NULL AND c.deleted_at IS NULL AND c.provider = 'codex'
+            """)
+            )
+            if (
+                await conn.execute(
+                    text("SELECT id FROM users WHERE routing_configured = 0 LIMIT 1")
+                )
+            ).first():
+                await conn.execute(
+                    text(
+                        "UPDATE users SET routing_configured = 1 WHERE routing_configured = 0"
+                    )
+                )
+            await conn.execute(
+                text("INSERT INTO schema_migrations (version) VALUES (7)")
+            )
         if not (
             await conn.execute(
                 text("SELECT version FROM schema_migrations WHERE version = 4")

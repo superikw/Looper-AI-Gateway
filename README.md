@@ -407,17 +407,52 @@ docker compose up -d
 docker compose exec -T looper-ai-admin python manage.py set-superadmin --username root
 ```
 
-管理页面为 `http://服务器IP:34568/`。如果防火墙未开放管理端口，也可以建立 SSH 隧道：
+默认直接访问 `http://服务器IP:34568/`，不需要 HTTPS 或反向代理。`ADMIN_REQUIRE_HTTPS=false` 为默认值；设置为 `true` 时才要求远程后台 API 使用 HTTPS（HTTP 返回 426），本机访问仍允许 HTTP。HTTPS 可由后台直接提供，也可以通过反向代理提供。登录只通过 POST 提交，密码不进入 URL，服务端使用加盐 PBKDF2 哈希；后续认证使用 HttpOnly 会话 Cookie，HTTPS 下带 Secure。HTTP 连接本身不加密传输；启用 HTTPS 后才有链路加密。
+
+**可选：没有反向代理时直接开启 HTTPS**
+
+在服务器项目目录执行（将 `服务器IP` 替换为浏览器访问的实际 IP；使用域名则填写域名；可重复 `--host` 添加多个地址）：
+
+```bash
+docker compose build looper-ai-admin
+docker compose run --rm --no-deps looper-ai-admin python manage.py generate-admin-cert --host 服务器IP
+```
+
+如需启用 HTTPS，在 `.env` 设置容器内的证书路径，并开启 HTTPS 要求：
+
+```dotenv
+ADMIN_REQUIRE_HTTPS=true
+ADMIN_SSL_CERTFILE=/app/data/admin-tls/cert.pem
+ADMIN_SSL_KEYFILE=/app/data/admin-tls/key.pem
+```
+
+```bash
+docker compose up -d --build looper-ai-admin
+```
+
+打开 `https://服务器IP:34568/`。同一管理端口会改为 HTTPS，不能继续用 HTTP；API 的 34567 端口不受影响。证书和私钥存放在已挂载的 `./data/admin-tls/`，生成命令不会覆盖已有文件，私钥权限为 0600。自签证书有效期一年，浏览器会提示不受信任；确认服务器证书后导入信任，或使用受信 CA 签发的证书替换。正式证书同样通过以上两个变量配置，证书更新后重启后台。
+
+**使用反向代理或 SSH 隧道**
+
+反向代理需转发 `Host` 和 `X-Forwarded-Proto: https`，并在管理容器中通过 `FORWARDED_ALLOW_IPS` 配置可信代理 IP；只信任实际代理地址，避免客户端伪造协议。也可以建立 SSH 隧道：
 
 ```bash
 ssh -N -L 34568:127.0.0.1:34568 用户名@服务器IP
 ```
 
+隧道建立后访问 `http://127.0.0.1:34568/`。若容器网络将本机请求识别为远程地址，可在仅允许隧道访问的部署中设置 `ADMIN_REQUIRE_HTTPS=false`，或继续使用 HTTPS 代理。
+
 超级管理员可以创建管理员。新管理员首次登录必须修改自动生成的初始密码；超级管理员重置密码会立即撤销该管理员的所有会话。普通用户创建时同时生成 API Key，明文 Key 只显示一次。
 
-后台提供按时区统计的今日、昨日、本周和本月用量、活动会话、请求日志、模型价格、日志清理以及 CPU、内存、磁盘监控。时区默认使用服务器本机时区，可在后台设置为 IANA 时区名称，例如 `Asia/Shanghai`。
+后台按页面划分为仪表盘、用户管理、请求日志、模型价格、上游账户和设置，各页面支持直接打开 URL。仪表盘提供今日、昨日、本周和本月用量以及 CPU、内存、磁盘监控。数据库统一保存 UTC，API 时间附 UTC 标记；活动会话、请求日志、管理员创建时间、价格更新时间、账户过期与额度重置等显示统一使用设置中的 IANA 时区，例如 `Asia/Shanghai`。统计边界也使用该时区。
 
-模型价格必须由管理员配置。`gpt-6-*` 等上游内部模型没有可核验的公开官方价格，系统不会自动猜测价格；未配置价格的请求费用显示为 `$0`，但 token 仍会记录。价格来源字段用于记录管理员采用的公开价目表或内部约定。
+上游账户页可以通过 OAuth 动态添加账户，删除、启停账户，修改 RPM、并发数、最小请求间隔和清除失败冷却。用户页可为用户多选上游账户，账户页可为账户多选用户；两侧编辑同一份路由。新用户和新账户默认无路由，无路由用户请求返回 503，无路由账户不参与这些用户的调度。多对多路由需要 `UPSTREAM_AUTH_MODE=oauth_manual`；单 Key 的旧绑定会进一步限制在用户的已分配账户范围内。升级会一次性将原有用户与原有账户池建立路由，保留旧 Key 绑定限制；后续新增项不再自动分配。
+
+账户状态包括凭证过期、失败冷却、累计请求与 token、失败数和进行中请求数。点击“刷新额度”会查询上游 `/wham/usage`，显示主/次额度窗口已用百分比、重置时间和快照更新时间。上游未提供的项目显示“未提供”，查询失败保留上次成功快照；本地累计用量与上游套餐额度分别展示。
+
+新请求记账时，若模型尚未定价，会精确匹配 [LiteLLM 价格目录](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json)，优先使用 OpenAI / Anthropic 等原厂 provider 条目，之后回退到 [OpenRouter 模型目录](https://openrouter.ai/api/v1/models)。不会用 Azure、Bedrock 等其他部署的价格代替原厂，也不会猜测相似模型、内部别名或自动去掉版本号。外部目录每 token 的美元价格统一换算为 USD / 百万 tokens；目录成功缓存一小时，失败一分钟后重试，最多并行等待约 3 秒，网络失败仍保留请求用量记录。
+
+模型价格页可以手动设置输入、输出和缓存读取价格，查看来源与更新时间。手动配置以及已有价格不会被自动覆盖；官方报价可对照 [OpenAI](https://developers.openai.com/api/docs/pricing) 和 [Claude](https://platform.claude.com/docs/en/about-claude/pricing)。这里的自动原厂价来自 LiteLLM 的原厂条目，并非实时抓取官方 HTML 价目表。未匹配模型在价格页列为待设置，费用暂记 `$0`；补价仅影响后续请求，不会回写历史账单。
 
 ```bash
 docker compose exec looper-ai-gateway python manage.py list-users
@@ -483,6 +518,9 @@ curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
 | `ADMIN_HOST_PORT` | 管理后台宿主机端口，默认 34568；Compose 端口映射使用 |
 | `ADMIN_BIND_ADDRESS` | 管理后台绑定地址，默认 0.0.0.0 |
 | `ADMIN_PORT` | 管理容器内部端口，默认 8081 |
+| `ADMIN_REQUIRE_HTTPS` | 默认 false，允许 HTTP；设为 true 才要求远程后台 API 使用 HTTPS |
+| `ADMIN_SSL_CERTFILE` | 后台直接提供 HTTPS 的 PEM 证书/证书链路径（Compose 使用容器内路径） |
+| `ADMIN_SSL_KEYFILE` | 对应 PEM 私钥路径；必须与证书同时配置 |
 | `DATABASE_URL` | 默认 `sqlite+aiosqlite:///./data/gateway.db` |
 | `CREDENTIAL_KEY_FILE` | 默认 `./data/credential.key`，首次使用自动生成，文件权限为 0600 |
 | `CREDENTIAL_ENCRYPTION_KEY` | 可选 Fernet 密钥；设置后优先于密钥文件，升级时必须保持一致 |

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Looper 管理后台</title>
+<link rel="stylesheet" href="/static/admin.css">
+<script src="/static/admin.js" defer></script>
+</head>
+<body data-require-https="true">
+<div id="notice" role="status" aria-live="polite"></div>
+<div id="app">
+<main class="login"><h1>Looper 管理后台</h1>
+<form id="login-form" method="post" action="/api/login">
+<label>用户名<input id="username" autocomplete="username" required maxlength="128"></label>
+<label>密码<input id="password" type="password" autocomplete="current-password" required maxlength="256"></label>
+<button type="submit">登录</button>
+</form><noscript>请启用 JavaScript 后登录。</noscript></main>
+</div>
+</body>
+</html>

@@ -246,3 +246,33 @@ async def test_upgrade_adds_pool_fields_and_preserves_legacy_data(key):
             )
             == 1
         )
+
+
+async def test_route_upgrade_preserves_pool_once():
+    # schema_migrations is a raw SQL table, outside Base.metadata used by the
+    # fixture. Explicitly emulate the pre-routing migration version.
+    await initialize_database()
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM schema_migrations WHERE version = 7"))
+    from sqlalchemy import select
+
+    from app.db import AsyncSessionLocal
+    from app.models import UpstreamCredential, User, UserUpstreamRoute
+
+    async with AsyncSessionLocal() as db:
+        user = User(name="old-user", routing_configured=False)
+        account = UpstreamCredential(provider="codex", access_token="private")
+        db.add_all([user, account])
+        await db.commit()
+        uid, cid = user.id, account.id
+    await initialize_database()
+    async with AsyncSessionLocal() as db:
+        routes = (await db.scalars(select(UserUpstreamRoute))).all()
+        assert [(r.user_id, r.upstream_credential_id) for r in routes] == [(uid, cid)]
+        assert (await db.get(User, uid)).routing_configured
+        db.add(UpstreamCredential(provider="codex", access_token="new-private"))
+        await db.commit()
+    await initialize_database()
+    async with AsyncSessionLocal() as db:
+        routes = (await db.scalars(select(UserUpstreamRoute))).all()
+        assert [(r.user_id, r.upstream_credential_id) for r in routes] == [(uid, cid)]

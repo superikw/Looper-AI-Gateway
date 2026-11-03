@@ -16,7 +16,7 @@ from app.config import settings
 from app.db import AsyncSessionLocal
 from app.http_client import ProxyTransportError
 from app.locks import database_lock, lock_path, try_process_lock
-from app.models import UpstreamCredential, UpstreamRequest
+from app.models import UpstreamCredential, UpstreamRequest, UserUpstreamRoute
 from app.oauth_manual import get_active_upstream_credential
 from app.token_utils import extract_account_id_from_token
 from app.utils import utcnow
@@ -127,7 +127,7 @@ class AccountLease:
 
 
 async def claim_account(
-    bound_id: int | None, excluded: set[int]
+    bound_id: int | None, excluded: set[int], user_id: int | None = None
 ) -> AccountLease | None:
     # Selection, rolling-window accounting and reservations share one short
     # process lock. Each in-flight request also holds its own OS lock, so long
@@ -185,6 +185,16 @@ async def claim_account(
                 UpstreamCredential.last_used_at,
                 UpstreamCredential.last_dispatched_at,
             ).where(UpstreamCredential.id.in_(available_account_ids()))
+            if user_id is not None:
+                # Empty assignments mean no route. Legacy key bindings narrow
+                # assignments and cannot bypass the user's route policy.
+                query = query.where(
+                    UpstreamCredential.id.in_(
+                        select(UserUpstreamRoute.upstream_credential_id).where(
+                            UserUpstreamRoute.user_id == user_id
+                        )
+                    )
+                )
             if bound_id is not None:
                 query = query.where(UpstreamCredential.id == bound_id)
             if excluded:
@@ -275,11 +285,14 @@ async def claim_account(
 
 
 async def wait_for_account(
-    bound_id: int | None, excluded: set[int], deadline: float
+    bound_id: int | None,
+    excluded: set[int],
+    deadline: float,
+    user_id: int | None = None,
 ) -> AccountLease | None:
     while True:
         try:
-            return await claim_account(bound_id, excluded)
+            return await claim_account(bound_id, excluded, user_id)
         except HTTPException as exc:
             if exc.status_code != 429:
                 raise

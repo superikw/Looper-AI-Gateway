@@ -11,13 +11,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.http_client import post_oauth
 from app.locks import database_lock
-from app.models import OAuthSession, UpstreamCredential
+from app.models import OAuthSession, UpstreamCredential, UserUpstreamRoute
 from app.token_utils import extract_account_id_from_token
 from app.utils import utcnow
 
@@ -72,6 +72,11 @@ async def logout_upstream_credentials(
                     )
                     .values(deleted_at=now, updated_at=now)
                     .execution_options(synchronize_session=False)
+                )
+                await db.execute(
+                    delete(UserUpstreamRoute).where(
+                        UserUpstreamRoute.upstream_credential_id.in_(ids)
+                    )
                 )
                 await db.commit()
                 return result.rowcount

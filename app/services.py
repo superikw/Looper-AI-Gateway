@@ -11,14 +11,14 @@ from typing import Any
 import anyio
 import httpx
 from fastapi import HTTPException, Request
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.codex_auth import CodexAuthError, codex_auth_manager
 from app.config import settings
 from app.db import AsyncSessionLocal
 from app.http_client import ProxyTransportError, get_http_client, proxy_transport_error
-from app.models import ApiKey, ModelPrice, UpstreamCredential, UsageLog
+from app.models import ApiKey, UpstreamCredential, UsageLog
 from app.oauth_manual import get_active_upstream_credential
 from app.protocol import (
     ResponseAccumulator,
@@ -191,7 +191,8 @@ async def _send_upstream(
     client = get_http_client()
     request_kwargs = {"content": raw_body} if raw_body is not None else {"json": body}
     response = await client.send(
-        client.build_request(method, url, headers=headers, **request_kwargs), stream=True
+        client.build_request(method, url, headers=headers, **request_kwargs),
+        stream=True,
     )
     log_debug(
         "upstream_response",
@@ -234,6 +235,8 @@ async def open_upstream(
         )
 
     if settings.upstream_auth_mode != "oauth_manual":
+        if db is not None and db.info.get("route_user_id") is not None:
+            raise HTTPException(503, "user account routing requires oauth_manual mode")
         if upstream_credential_id is not None:
             raise HTTPException(503, "account bindings require oauth_manual mode")
         bearer, account = await resolve_upstream_credential(db)
@@ -259,7 +262,9 @@ async def open_upstream(
     )
     for attempt in range(attempts):
         try:
-            lease = await wait_for_account(upstream_credential_id, excluded, deadline)
+            lease = await wait_for_account(
+                upstream_credential_id, excluded, deadline, db.info.get("route_user_id")
+            )
         except TimeoutError:
             raise HTTPException(503, "upstream account scheduler is busy") from None
         except HTTPException as exc:
@@ -439,9 +444,7 @@ def format_upstream_result(
     return status_code, normalize_codex_response_to_responses(data)
 
 
-async def read_upstream_data(
-    response: httpx.Response, path: str | None = None
-) -> dict:
+async def read_upstream_data(response: httpx.Response, path: str | None = None) -> dict:
     if (
         "text/event-stream" in response.headers.get("content-type", "")
         and response.status_code < 400
@@ -471,10 +474,10 @@ async def read_upstream_data(
         ) from None
     if not isinstance(data, dict):
         raise HTTPException(502, "upstream returned a non-object response")
-    if response.status_code < 400 and path not in (
-        "/v1/images/generations", "/v1/images/edits"
-    ) and not any(
-        key in data for key in ("output", "output_text", "error")
+    if (
+        response.status_code < 400
+        and path not in ("/v1/images/generations", "/v1/images/edits")
+        and not any(key in data for key in ("output", "output_text", "error"))
     ):
         raise HTTPException(502, "upstream returned an invalid response")
     return data
@@ -560,15 +563,22 @@ async def record_usage(
         usage.get("completion_tokens") or usage.get("output_tokens") or 0
     )
     total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-    price = await db.scalar(select(ModelPrice).where(ModelPrice.model == model)) if model else None
+    from app.pricing import ensure_model_price
+
+    price = await ensure_model_price(db, model)
     cost_usd = 0.0
     if price:
-        details = usage.get("input_tokens_details") or {}
+        details = (
+            usage.get("input_tokens_details")
+            or usage.get("prompt_tokens_details")
+            or {}
+        )
         cached = int(
             usage.get("cached_input_tokens")
             or (details.get("cached_tokens") if isinstance(details, dict) else 0)
             or 0
         )
+        cached = min(max(cached, 0), prompt_tokens)
         billable_prompt = max(prompt_tokens - cached, 0)
         cost_usd = (
             billable_prompt * price.input_usd_per_million
@@ -664,9 +674,7 @@ async def parse_request_json(
     return result
 
 
-async def read_request_body(
-    request: Request, *, path: str | None = None
-) -> bytes:
+async def read_request_body(request: Request, *, path: str | None = None) -> bytes:
     limit, setting_name = request_body_limit(path)
     body = bytearray()
     async for chunk in request.stream():

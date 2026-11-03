@@ -92,9 +92,9 @@ class AdminOut(BaseModel):
 
 class ModelPriceIn(BaseModel):
     model: str = Field(min_length=1, max_length=128)
-    input_usd_per_million: float = Field(ge=0)
-    output_usd_per_million: float = Field(ge=0)
-    cached_input_usd_per_million: float = Field(default=0, ge=0)
+    input_usd_per_million: float = Field(ge=0, allow_inf_nan=False)
+    output_usd_per_million: float = Field(ge=0, allow_inf_nan=False)
+    cached_input_usd_per_million: float = Field(default=0, ge=0, allow_inf_nan=False)
     source: str = Field(default="manual", max_length=255)
 
 
@@ -124,3 +124,13 @@ class UpstreamAccountUpdate(BaseModel):
         default=0, strict=True, ge=0, le=3600, allow_inf_nan=False
     )
     reset_cooldown: StrictBool = False
+
+
+class UserRouteUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    upstream_ids: list[int] = Field(max_length=1000)
+
+
+class UpstreamRouteUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    user_ids: list[int] = Field(max_length=1000)

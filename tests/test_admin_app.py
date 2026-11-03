@@ -20,7 +20,7 @@ async def admin_client():
         )
         await db.commit()
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=admin_app), base_url="http://admin"
+        transport=httpx.ASGITransport(app=admin_app), base_url="https://admin"
     ) as client:
         yield client
 
@@ -70,3 +70,346 @@ async def test_dashboard_calculates_cost(admin_client, key):
     dashboard = (await admin_client.get("/api/dashboard")).json()
     assert dashboard["periods"]["day"]["tokens"] == 10
     assert dashboard["periods"]["day"]["cost_usd"] == 0.25
+
+
+async def sign_in(client):
+    response = await client.post(
+        "/api/login", json={"username": "root", "password": "root-password-123"}
+    )
+    assert response.status_code == 200
+    return response
+
+
+async def test_login_security_and_separate_pages(admin_client):
+    response = await sign_in(admin_client)
+    cookie = response.headers["set-cookie"]
+    assert "HttpOnly" in cookie and "Secure" in cookie
+    for path in (
+        "/",
+        "/dashboard",
+        "/users",
+        "/logs",
+        "/prices",
+        "/settings",
+        "/upstreams",
+    ):
+        response = await admin_client.get(path)
+        assert response.status_code == 200
+        assert 'method="post"' in response.text
+        assert 'type="password"' in response.text
+        assert "onsubmit=" not in response.text
+        assert "script-src 'self'" in response.headers["content-security-policy"]
+    assert (await admin_client.get("/api/login?password=secret")).status_code == 400
+    assert (await admin_client.get("/api/login")).status_code == 405
+    response = await admin_client.put(
+        "/api/settings",
+        json={"timezone": "UTC"},
+        headers={"Origin": "https://evil.invalid"},
+    )
+    assert response.status_code == 403
+    assert (await admin_client.get("/static/admin.js")).status_code == 200
+
+
+async def test_remote_http_is_rejected_when_https_required(admin_client, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "admin_require_https", True)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=admin_app), base_url="http://admin"
+    ) as client:
+        response = await client.post(
+            "/api/login", json={"username": "root", "password": "root-password-123"}
+        )
+        assert response.status_code == 426
+        assert "admin_session" not in response.cookies
+
+
+async def test_timestamps_have_utc_offset_and_settings_apply(admin_client, key):
+    from datetime import datetime
+
+    from app.models import ActiveSession
+
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        db.add(
+            ActiveSession(
+                id="active-test",
+                user_id=key.user_id,
+                api_key_id=key.id,
+                path="/v1/responses",
+                model="test",
+                started_at=datetime(2026, 1, 1, 0, 0),
+            )
+        )
+        db.add(
+            UsageLog(
+                user_id=key.user_id,
+                api_key_id=key.id,
+                path="/v1/responses",
+                status_code=200,
+                created_at=datetime(2026, 1, 1, 0, 0),
+            )
+        )
+        await db.commit()
+    response = await admin_client.put(
+        "/api/settings", json={"timezone": "Asia/Shanghai"}
+    )
+    assert response.json()["timezone"] == "Asia/Shanghai"
+    logs = (await admin_client.get("/api/logs")).json()
+    sessions = (await admin_client.get("/api/sessions")).json()
+    assert logs[0]["created_at"] == "2026-01-01T00:00:00Z"
+    assert sessions[0]["started_at"] == "2026-01-01T00:00:00Z"
+    assert (
+        await admin_client.put("/api/settings", json={"timezone": "invalid/timezone"})
+    ).status_code == 400
+
+
+async def test_bidirectional_routes_and_empty_assignment(admin_client, key):
+    from app.models import UpstreamCredential
+    from app.upstreams import claim_account
+
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        a = UpstreamCredential(provider="codex", name="A", access_token="secret-a")
+        b = UpstreamCredential(provider="codex", name="B", access_token="secret-b")
+        db.add_all([a, b])
+        await db.commit()
+        first, second = a.id, b.id
+    created = (await admin_client.post("/api/users", json={"name": "other"})).json()
+    uid = created["id"]
+    assert await claim_account(None, set(), uid) is None
+    assert (
+        await admin_client.put(
+            f"/api/users/{uid}/upstreams", json={"upstream_ids": [first, second, first]}
+        )
+    ).status_code == 200
+    users = (await admin_client.get("/api/users")).json()
+    assert sorted(next(u for u in users if u["id"] == uid)["upstream_ids"]) == [
+        first,
+        second,
+    ]
+    assert (
+        await admin_client.put(
+            f"/api/upstreams/{first}/users", json={"user_ids": [uid, key.user_id]}
+        )
+    ).status_code == 200
+    lease = await claim_account(None, set(), uid)
+    assert lease.credential_id in {first, second}
+    await lease.release()
+    # Narrowing by a key must never escape assignments.
+    await admin_client.put(
+        f"/api/users/{uid}/upstreams", json={"upstream_ids": [second]}
+    )
+    assert await claim_account(first, set(), uid) is None
+    # Failed assignment leaves the old routes intact.
+    assert (
+        await admin_client.put(
+            f"/api/users/{uid}/upstreams", json={"upstream_ids": [99999]}
+        )
+    ).status_code == 404
+    lease = await claim_account(None, set(), uid)
+    assert lease.credential_id == second
+    await lease.release()
+    await admin_client.put(f"/api/users/{uid}/upstreams", json={"upstream_ids": []})
+    assert await claim_account(None, set(), uid) is None
+    pool = (await admin_client.get("/api/upstreams")).json()["accounts"]
+    assert next(a for a in pool if a["id"] == second)["user_ids"] == []
+    assert "secret-a" not in str(pool)
+
+
+async def test_new_user_no_route_rejects_real_proxy_request(
+    admin_client, client, monkeypatch
+):
+    from app.config import settings
+    from app.models import UpstreamCredential
+
+    monkeypatch.setattr(settings, "upstream_auth_mode", "oauth_manual")
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        db.add(
+            UpstreamCredential(
+                provider="codex", access_token="secret", account_id="account"
+            )
+        )
+        await db.commit()
+    user = (await admin_client.post("/api/users", json={"name": "unassigned"})).json()
+    response = await client.post(
+        "/v1/responses",
+        headers={"Authorization": "Bearer " + user["api_key"]},
+        json={"model": "gpt-test", "input": "hello"},
+    )
+    assert response.status_code == 503
+
+
+async def test_upstream_maintenance_and_quota(admin_client, monkeypatch):
+    from app.models import UpstreamCredential
+
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        account = UpstreamCredential(
+            provider="codex", access_token="secret-token", account_id="account"
+        )
+        db.add(account)
+        await db.commit()
+        cid = account.id
+
+    class QuotaClient:
+        async def get(self, url, **kwargs):
+            assert url.endswith("/wham/usage")
+            assert kwargs["headers"]["Authorization"] == "Bearer secret-token"
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", url),
+                json={
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 25,
+                            "reset_at": 1800000000,
+                            "limit_window_seconds": 18000,
+                        }
+                    },
+                },
+            )
+
+    monkeypatch.setattr("app.admin_upstreams.get_http_client", lambda: QuotaClient())
+    quota = await admin_client.post(f"/api/upstreams/{cid}/usage/refresh")
+    assert quota.status_code == 200
+    assert quota.json()["primary"]["used_percent"] == 25
+    assert quota.json()["primary"]["reset_at"].endswith("+00:00")
+    pool = await admin_client.get("/api/upstreams")
+    assert pool.json()["accounts"][0]["quota"]["plan_type"] == "plus"
+    assert "secret-token" not in pool.text
+    assert (
+        await admin_client.patch(
+            f"/api/upstreams/{cid}",
+            json={"enabled": False, "max_rpm": 5, "max_concurrency": 2},
+        )
+    ).status_code == 200
+    assert (await admin_client.get("/api/upstreams")).json()["accounts"][0][
+        "status"
+    ] == "disabled"
+    assert (await admin_client.delete(f"/api/upstreams/{cid}")).status_code == 200
+    assert (await admin_client.get("/api/upstreams")).json()["accounts"] == []
+
+
+async def test_upstream_add_oauth(admin_client, monkeypatch):
+    await sign_in(admin_client)
+
+    async def exchange(code, verifier):
+        return {
+            "account_id": "new-account",
+            "access_token": "private-access",
+            "refresh_token": "private-refresh",
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr("app.oauth_manual.exchange_code_for_token", exchange)
+    start = (await admin_client.post("/api/upstreams/oauth/start")).json()
+    response = await admin_client.post(
+        "/api/upstreams/oauth/complete",
+        json={
+            "session_id": start["session_id"],
+            "name": "Added",
+            "callback_url": f"http://localhost:1455/auth/callback?code=test&state={start['state']}",
+        },
+    )
+    assert response.status_code == 200
+    assert "private-" not in response.text
+    account = (await admin_client.get("/api/upstreams")).json()["accounts"][0]
+    assert account["name"] == "Added" and account["user_ids"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_assigned_routes_control_real_proxy_dispatch(
+    admin_client, client, monkeypatch, stream
+):
+    import json
+
+    from app.config import settings
+    from app.models import UpstreamCredential
+
+    monkeypatch.setattr(settings, "upstream_auth_mode", "oauth_manual")
+    await sign_in(admin_client)
+    async with AsyncSessionLocal() as db:
+        first = UpstreamCredential(
+            provider="codex", account_id="unassigned-account", access_token="private-a"
+        )
+        second = UpstreamCredential(
+            provider="codex", account_id="assigned-account", access_token="private-b"
+        )
+        db.add_all([first, second])
+        await db.commit()
+        cid = second.id
+    created = (await admin_client.post("/api/users", json={"name": "routed"})).json()
+    await admin_client.put(
+        f"/api/users/{created['id']}/upstreams", json={"upstream_ids": [cid]}
+    )
+    dispatched = []
+
+    def handle(request):
+        dispatched.append(request.headers["chatgpt-account-id"])
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 2, "output_tokens": 1},
+                    },
+                }
+            )
+            + "\n\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as upstream:
+        monkeypatch.setattr("app.services.get_http_client", lambda: upstream)
+        response = await client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer " + created["api_key"]},
+            json={"model": "gpt-test", "input": "hello", "stream": stream},
+        )
+    assert response.status_code == 200, response.text
+    assert dispatched == ["assigned-account"]
+
+
+async def test_login_attempts_are_limited(admin_client):
+    from app.admin_app import _login_failures
+
+    try:
+        for _ in range(5):
+            response = await admin_client.post(
+                "/api/login", json={"username": "root", "password": "incorrect"}
+            )
+            assert response.status_code == 401
+        response = await admin_client.post(
+            "/api/login", json={"username": "root", "password": "incorrect"}
+        )
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == "60"
+    finally:
+        _login_failures.clear()
+
+
+async def test_remote_http_login_allowed_by_default(admin_client, monkeypatch):
+    from app.config import Settings, settings
+
+    assert Settings(_env_file=None).admin_require_https is False
+    monkeypatch.setattr(settings, "admin_require_https", False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=admin_app), base_url="http://admin"
+    ) as client:
+        html = await client.get("/")
+        assert 'data-require-https="false"' in html.text
+        response = await client.post(
+            "/api/login", json={"username": "root", "password": "root-password-123"}
+        )
+        assert response.status_code == 200
+        assert "HttpOnly" in response.headers["set-cookie"]
+        assert "Secure" not in response.headers["set-cookie"]
+        assert (await client.get("/api/me")).status_code == 200

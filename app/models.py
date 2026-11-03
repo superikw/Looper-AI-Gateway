@@ -27,6 +27,10 @@ class User(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
+    routing_configured: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1"
+    )
+
     api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="user")
 
 
@@ -82,7 +86,9 @@ class AdminAccount(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(Text)
-    is_superadmin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    is_superadmin: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
     must_change_password: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1"
     )
@@ -197,3 +203,12 @@ class UpstreamRequest(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     dispatched: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class UserUpstreamRoute(Base):
+    __tablename__ = "user_upstream_routes"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    upstream_credential_id: Mapped[int] = mapped_column(
+        ForeignKey("upstream_credentials.id"), primary_key=True, index=True
+    )

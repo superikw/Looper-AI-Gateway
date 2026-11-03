@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.admin_service import hash_password
+from app.admin_tls import generate_certificate
 from app.config import settings
 from app.db import AsyncSessionLocal, engine
 from app.http_client import close_http_client
@@ -42,6 +43,22 @@ async def ensure_db() -> None:
 
 async def cmd_generate_admin_token(_: argparse.Namespace) -> None:
     print(secrets.token_hex(32))
+
+
+async def cmd_generate_admin_cert(args: argparse.Namespace) -> None:
+    try:
+        cert, key = generate_certificate(args.host, Path(args.output_dir))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from None
+    print_json(
+        {
+            "certificate": str(cert),
+            "private_key": str(key),
+            "hosts": args.host,
+            "self_signed": True,
+            "valid_days": 365,
+        }
+    )
 
 
 async def cmd_set_superadmin(args: argparse.Namespace) -> None:
@@ -428,6 +445,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "generate-admin-token", help="Generate a strong ADMIN_TOKEN"
     ).set_defaults(func=cmd_generate_admin_token)
+    p = sub.add_parser(
+        "generate-admin-cert",
+        help="Generate a self-signed certificate for native admin HTTPS",
+    )
+    p.add_argument(
+        "--host",
+        action="append",
+        required=True,
+        help="Server IP or DNS name; repeat for multiple names",
+    )
+    p.add_argument("--output-dir", default="./data/admin-tls")
+    p.set_defaults(func=cmd_generate_admin_cert)
     p = sub.add_parser("set-superadmin", help="Set the local super administrator")
     p.add_argument("--username", required=True)
     p.add_argument("--password")
