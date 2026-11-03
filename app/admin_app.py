@@ -61,8 +61,8 @@ admin_app = FastAPI(title="Looper AI Gateway Admin", lifespan=lifespan)
 
 
 @admin_app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return ADMIN_HTML
+async def index() -> HTMLResponse:
+    return HTMLResponse(ADMIN_HTML, headers={"Cache-Control": "no-store"})
 
 
 async def current_admin(
