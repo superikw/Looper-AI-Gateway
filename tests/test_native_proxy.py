@@ -88,6 +88,12 @@ async def test_native_failover_logs_each_attempt_and_counts_user_once(
     assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{8}", rid)
     assert all(log.gateway_request_id == rid for log in logs)
     assert [log.upstream_request_id for log in logs] == ["request-0", "request-1"]
+    assert attempts[0].retry_reason == "retryable_business_error"
+    assert attempts[0].preview_stop_reason == "retryable_failure"
+    assert attempts[0].failure_event_ms is not None
+    assert attempts[0].response_headers_ms is not None
+    assert attempts[0].preview_elapsed_ms is not None
+    assert attempts[1].failure_event_ms is None
     async with AsyncSessionLocal() as db:
         saved = await db.get(ApiKey, key.id)
         assert saved.request_count == 1 and saved.total_tokens == 9
@@ -99,15 +105,30 @@ async def test_native_failover_logs_each_attempt_and_counts_user_once(
     assert (await admin_client.get("/api/dashboard")).json()["periods"]["day"][
         "requests"
     ] == 1
+    chain = (await admin_client.get(f"/api/logs/{logs[0].id}/attempts")).json()
+    assert chain[0]["retry_reason"] == "retryable_business_error"
+    assert chain[0]["preview_stop_reason"] == "retryable_failure"
+    assert chain[0]["response_headers_ms"] == attempts[0].response_headers_ms
+    assert chain[0]["failure_event_ms"] == attempts[0].failure_event_ms
 
 
-@pytest.mark.parametrize("code", ["overloaded_error", "service_unavailable"])
+@pytest.mark.parametrize(
+    "code", ["overloaded_error", "service_unavailable", "server_is_overloaded"]
+)
 async def test_native_early_errors_retry_without_changing_success_stream(
     client, key, pool, code
 ):
     _, state = pool
     state["omit_content_type"] = True
-    state["plans"][0] = [failed(error={"code": code, "message": "temporary failure"})]
+    state["plans"][0] = [
+        failed(
+            error={
+                "type": "service_unavailable_error",
+                "code": code,
+                "message": "temporary failure",
+            }
+        )
+    ]
     response = await request(client)
     assert response.status_code == 200 and state["calls"] == [0, 1]
     assert (
@@ -138,6 +159,10 @@ async def test_native_error_after_output_is_forwarded_without_replay(client, key
         == "".join("data: " + json.dumps(item) + "\n\n" for item in data).encode()
     )
     assert (await rows())[1][0].status_code == 502
+    diagnostic = (await rows())[0][0]
+    assert diagnostic.retry_reason == "meaningful_output"
+    assert diagnostic.preview_stop_reason == "meaningful_output"
+    assert diagnostic.failure_event_ms is not None
 
 
 async def test_native_no_spare_keeps_original_failed_event_and_single_log(
@@ -154,6 +179,8 @@ async def test_native_no_spare_keeps_original_failed_event_and_single_log(
     assert response.content == ("data: " + json.dumps(failed()) + "\n\n").encode()
     _, logs, active = await rows()
     assert len(logs) == 1 and logs[0].is_final and active == 0
+    diagnostic = (await rows())[0][0]
+    assert diagnostic.retry_reason == "no_available_account"
     async with AsyncSessionLocal() as db:
         assert (await db.get(ApiKey, key.id)).request_count == 1
 
@@ -170,6 +197,9 @@ async def test_stateful_request_does_not_fail_over(client, key, pool, payload):
         json={"model": "gpt-test", "input": [], "stream": True, **payload},
     )
     assert state["calls"] == [0]
+    diagnostic = (await rows())[0][0]
+    assert diagnostic.retry_reason == "stateful_request"
+    assert diagnostic.preview_stop_reason == "retryable_failure"
 
 
 @pytest.mark.parametrize(
@@ -190,6 +220,10 @@ async def test_quota_or_excessive_retry_after_stops_and_preserves_error(
     response = await request(client)
     assert response.status_code == status and response.content == wire
     assert state["calls"] == [0] and len((await rows())[1]) == 1
+    diagnostic = (await rows())[0][0]
+    assert diagnostic.retry_reason == (
+        "permanent_error" if status == 429 else "retry_after_exceeds_limit"
+    )
 
 
 async def test_backoff_is_bounded_and_releases_lease_before_waiting(
@@ -221,6 +255,7 @@ async def test_backoff_budget_exhaustion_does_not_make_another_attempt(
     monkeypatch.setattr(settings, "upstream_retry_max_wait_seconds", 0.1)
     await request(client)
     assert state["calls"] == [0]
+    assert (await rows())[0][0].retry_reason == "backoff_budget_exhausted"
 
 
 async def test_native_cancellation_releases_all_resources(client, key, pool):
@@ -543,3 +578,116 @@ async def test_large_observation_does_not_truncate_or_invent_failure(client, key
     assert (
         logs[0].status_code == 200 and logs[0].failure_category is None and active == 0
     )
+
+
+@pytest.mark.parametrize("stream", [True, False])
+async def test_preview_timeout_records_failure_time_without_replay(
+    client, key, pool, monkeypatch, stream
+):
+    _, state = pool
+    monkeypatch.setattr(settings, "sse_preview_max_seconds", 0.01)
+    data = [life(), 0.06, failed()]
+    state["plans"][0] = data
+    response = await request(client, stream=stream)
+    assert state["calls"] == [0] and response.status_code == 200
+    assert response.content == b"".join(
+        ("data: " + json.dumps(event) + "\n\n").encode()
+        for event in data
+        if isinstance(event, dict)
+    )
+    attempts, logs, active = await rows()
+    diagnostic = attempts[0]
+    assert diagnostic.retry_reason == "preview_timeout"
+    assert diagnostic.preview_stop_reason == "preview_timeout"
+    assert 8 <= diagnostic.preview_elapsed_ms < diagnostic.failure_event_ms
+    assert diagnostic.failure_event_ms >= 50
+    assert diagnostic.response_headers_ms >= 0
+    assert diagnostic.elapsed_ms >= diagnostic.response_headers_ms + 50
+    assert len(attempts) == len(logs) == 1 and active == 0
+
+
+@pytest.mark.parametrize(
+    "boundary,expected",
+    [
+        ("events", "preview_event_limit"),
+        ("bytes", "preview_byte_limit"),
+        ("unknown", "unknown_event"),
+        ("error", "non_retryable_error"),
+        ("disabled", "early_retry_disabled"),
+        ("attempts", "attempt_limit"),
+        ("binding", "bound_account"),
+    ],
+)
+async def test_no_retry_reason_is_persisted_without_changing_body(
+    client, key, pool, monkeypatch, boundary, expected
+):
+    ids, state = pool
+    source = [failed()]
+    if boundary == "events":
+        monkeypatch.setattr(settings, "sse_preview_max_events", 1)
+        source.insert(0, life())
+    elif boundary == "bytes":
+        monkeypatch.setattr(settings, "sse_preview_max_bytes", 1024)
+        source.insert(0, b":" + b"x" * 2048 + b"\n\n")
+    elif boundary == "unknown":
+        source.insert(0, {"type": "vendor.event", "private_content": "secret-text"})
+    elif boundary == "error":
+        source = [failed(error={"code": "unknown", "message": "different failure"})]
+    elif boundary == "disabled":
+        monkeypatch.setattr(settings, "sse_early_retry", False)
+    elif boundary == "attempts":
+        monkeypatch.setattr(settings, "upstream_max_attempts", 1)
+    elif boundary == "binding":
+        async with AsyncSessionLocal() as db:
+            (await db.get(ApiKey, key.id)).upstream_credential_id = ids[0]
+            await db.commit()
+    state["plans"][0] = source
+    response = await request(client)
+    assert response.content == b"".join(
+        item
+        if isinstance(item, bytes)
+        else ("data: " + json.dumps(item) + "\n\n").encode()
+        for item in source
+    )
+    attempts, _, active = await rows()
+    assert state["calls"] == [0] and active == 0
+    assert attempts[0].retry_reason == expected
+    assert attempts[0].failure_event_ms is not None
+    assert attempts[0].response_headers_ms is not None
+    assert "secret-text" not in json.dumps(attempts[0].__dict__, default=str)
+
+
+async def test_failure_time_excludes_connection_wait(client, key, pool, monkeypatch):
+    import app.services as services
+
+    _, state = pool
+    state["plans"][0] = [failed()]
+    monkeypatch.setattr(settings, "upstream_max_attempts", 1)
+    send = services._send_upstream
+
+    async def delayed_send(*args, **kwargs):
+        await asyncio.sleep(0.06)
+        return await send(*args, **kwargs)
+
+    monkeypatch.setattr(services, "_send_upstream", delayed_send)
+    await request(client)
+    diagnostic = (await rows())[0][0]
+    assert diagnostic.response_headers_ms >= 50
+    assert diagnostic.failure_event_ms < diagnostic.response_headers_ms
+
+
+async def test_failure_observation_does_not_include_trailing_stream_wait(
+    client, key, pool
+):
+    _, state = pool
+    source = [
+        {"type": "response.output_text.delta", "delta": "partial"},
+        failed(),
+        0.08,
+        b": trailing heartbeat\n\n",
+    ]
+    state["plans"][0] = source
+    await request(client)
+    diagnostic = (await rows())[0][0]
+    assert diagnostic.elapsed_ms - diagnostic.failure_event_ms >= 60
+    assert diagnostic.retry_reason == "meaningful_output"

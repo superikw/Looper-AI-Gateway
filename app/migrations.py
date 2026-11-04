@@ -166,10 +166,20 @@ async def initialize_database() -> None:
                 col["name"] for col in inspect(c).get_columns("upstream_attempts")
             }
         )
-        if "retry_count" not in attempt_columns:
-            await conn.execute(
-                text("ALTER TABLE upstream_attempts ADD COLUMN retry_count INTEGER")
-            )
+        for field, definition in {
+            "retry_count": "INTEGER",
+            "retry_reason": "VARCHAR(64)",
+            "preview_stop_reason": "VARCHAR(64)",
+            "response_headers_ms": "INTEGER",
+            "preview_elapsed_ms": "INTEGER",
+            "failure_event_ms": "INTEGER",
+        }.items():
+            if field not in attempt_columns:
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE upstream_attempts ADD COLUMN {field} {definition}"
+                    )
+                )
         if "gateway_request_id" not in usage_columns:
             await conn.execute(
                 text("ALTER TABLE usage_logs ADD COLUMN gateway_request_id VARCHAR(64)")

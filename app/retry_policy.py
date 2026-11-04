@@ -49,16 +49,20 @@ def permanent_failure(result):
 class RetryBudget:
     def __init__(self):
         self.waited = 0.0
+        self.reason = None
 
     def reserve(self, retry_count, minimum=0.0):
+        self.reason = None
         maximum = settings.upstream_retry_max_delay_seconds
         if minimum > maximum:
+            self.reason = "retry_after_exceeds_limit"
             return None
         delay = min(
             maximum, settings.upstream_retry_base_delay_seconds * 2 ** (retry_count - 1)
         )
         delay = min(maximum, max(minimum, delay) * (1 + random.random() * 0.2))
         if self.waited + delay > settings.upstream_retry_max_wait_seconds:
+            self.reason = "backoff_budget_exhausted"
             return None
         self.waited += delay
         return delay

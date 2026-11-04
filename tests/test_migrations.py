@@ -343,3 +343,47 @@ async def test_upgrade_adds_request_ids_without_changing_historical_usage(key):
             and row.retry_count is None
             and row.upstream_http_status is None
         )
+
+
+async def test_attempt_diagnostics_migration_preserves_existing_chain():
+    from sqlalchemy import select
+
+    from app.db import AsyncSessionLocal
+    from app.models import UpstreamAttempt
+
+    async with AsyncSessionLocal() as db:
+        db.add(
+            UpstreamAttempt(
+                gateway_request_id="old-request",
+                attempt=1,
+                retry_count=0,
+                upstream_credential_id=2,
+                path="/v1/responses",
+                upstream_http_status=200,
+                failure_category="sse_business",
+                upstream_error_code="server_is_overloaded",
+                retry_decision="return",
+                elapsed_ms=3606,
+            )
+        )
+        await db.commit()
+    fields = (
+        "retry_reason",
+        "preview_stop_reason",
+        "response_headers_ms",
+        "preview_elapsed_ms",
+        "failure_event_ms",
+    )
+    async with engine.begin() as conn:
+        for field in fields:
+            await conn.execute(
+                text(f"ALTER TABLE upstream_attempts DROP COLUMN {field}")
+            )
+    await initialize_database()
+    await initialize_database()
+    async with AsyncSessionLocal() as db:
+        row = await db.scalar(select(UpstreamAttempt))
+        assert row.gateway_request_id == "old-request" and row.retry_count == 0
+        assert row.upstream_error_code == "server_is_overloaded"
+        assert row.elapsed_ms == 3606 and row.retry_decision == "return"
+        assert all(getattr(row, field) is None for field in fields)

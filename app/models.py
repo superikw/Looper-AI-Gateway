@@ -256,5 +256,10 @@ class UpstreamAttempt(Base):
         String(128), nullable=True
     )
     retry_decision: Mapped[str] = mapped_column(String(64))
+    retry_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    preview_stop_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    response_headers_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preview_elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_event_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     elapsed_ms: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

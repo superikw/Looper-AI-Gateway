@@ -23,6 +23,23 @@ function date(value) {
   return Number.isNaN(parsed.getTime()) ? '—' : new Intl.DateTimeFormat('zh-CN', {timeZone:config.timezone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(parsed);
 }
 const money = value => '$' + Number(value || 0).toFixed(6);
+const retryReasons = {
+  preview_timeout:'预读取超时',preview_event_limit:'预读取事件数达到上限',preview_byte_limit:'预读取字节数达到上限',
+  meaningful_output:'已观察到输出或工具调用',unknown_event:'遇到未知事件',invalid_event:'事件格式无法识别',
+  non_retryable_error:'错误不符合重试白名单',retryable_failure:'识别到可重试失败',
+  bound_account:'Key 固定绑定账号',stateful_request:'请求依赖会话续接状态',
+  attempt_limit:'达到尝试次数上限',retry_after_exceeds_limit:'上游要求的等待超过上限',backoff_budget_exhausted:'累计退避预算不足',
+  early_retry_disabled:'早期业务重试已关闭',unsupported_content_type:'响应类型不在预读取范围',
+  path_not_eligible:'接口不适用早期业务重试',http_status_not_eligible:'HTTP 状态不适用早期业务重试',non_pool_auth:'未使用 OAuth 账号池',
+  no_available_account:'没有可用备用账号',scheduler_timeout:'等待备用账号超时',
+  retryable_business_error:'早期业务失败，尝试换号',retryable_http_error:'HTTP 错误，尝试换号',
+  permanent_error:'额度、计费或账号停用错误',credential_unavailable:'所选凭证不可用',connect_failure:'连接建立失败',
+  proxy_transport_no_retry:'代理路径传输故障，不换号',unsafe_transport_retry:'无法安全重放的传输故障',
+  response_already_forwarded:'已进入正常转发',terminal_event:'收到终止事件',stream_ended:'上游流结束',json_response:'普通 JSON 响应',
+  body_complete:'错误正文读取完成',preview_interrupted:'预读取被中断',client_cancelled:'客户端取消',gateway_internal:'网关内部异常',local_capacity:'本地容量不足'
+};
+const retryReason = value => value ? `${esc(retryReasons[value] || value)}<small>${esc(value)}</small>` : '—';
+const millis = value => value == null ? '—' : `${esc(value)} ms`;
 const table = (headers, rows) => `<div class="table-wrap"><table><thead><tr>${headers.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('') || `<tr><td colspan="${headers.length}" class="muted">暂无数据</td></tr>`}</tbody></table></div>`;
 const button = (action, label, id='') => `<button type="button" data-action="${action}" data-id="${esc(id)}">${label}</button>`;
 function modal(title, html, submit) {
@@ -135,7 +152,8 @@ async function act(action, id) {
     case 'attempts': {
       const rows=await api(`/api/logs/${id}/attempts`);
       const dialog=document.createElement('dialog');
-      dialog.innerHTML=`<h2>请求尝试链路</h2><p>${esc(rows[0]?.gateway_request_id || '无尝试记录')}</p>${table(['重试次数','上游编号','HTTP','结果分类','错误类型 / 代码','传输异常类型','处理决定','耗时 ms','上游请求 ID'],rows.map(r=>`<tr><td>${r.retry_count ?? r.attempt-1}</td><td>${esc(r.upstream_credential_id ?? '—')}</td><td>${esc(r.upstream_http_status ?? '—')}</td><td>${esc(r.failure_category || '成功')}</td><td>${esc(r.upstream_error_type)} / ${esc(r.upstream_error_code)}</td><td>${esc(r.transport_exception_type)}</td><td>${esc(r.retry_decision)}</td><td>${r.elapsed_ms}</td><td>${esc(r.upstream_request_id)}</td></tr>`))}<button type="button" data-close>关闭</button>`;
+      dialog.className='attempt-dialog';
+      dialog.innerHTML=`<h2>请求尝试链路</h2><p>${esc(rows[0]?.gateway_request_id || '无尝试记录')}</p><p class="muted">响应头耗时从本次尝试开始计算；失败事件时间从收到响应头开始计算，表示网关识别到失败的时间。历史记录缺少的诊断显示为 —。</p>${table(['重试次数','上游编号','HTTP','结果分类','错误类型 / 代码','传输异常类型','处理决定 / 原因','预读取结束原因','时间定位','总耗时','上游请求 ID'],rows.map(r=>`<tr><td>${r.retry_count ?? r.attempt-1}</td><td>${esc(r.upstream_credential_id ?? '—')}</td><td>${esc(r.upstream_http_status ?? '—')}</td><td>${esc(r.failure_category || '成功')}</td><td>${esc(r.upstream_error_type)} / ${esc(r.upstream_error_code)}</td><td>${esc(r.transport_exception_type)}</td><td>${esc(r.retry_decision)}<div>${retryReason(r.retry_reason)}</div></td><td>${retryReason(r.preview_stop_reason)}<small>预读取耗时 ${millis(r.preview_elapsed_ms)}</small></td><td>响应头 ${millis(r.response_headers_ms)}<small>失败事件 +${millis(r.failure_event_ms)}</small></td><td>${millis(r.elapsed_ms)}</td><td>${esc(r.upstream_request_id)}</td></tr>`))}<button type="button" data-close>关闭</button>`;
       dialog.querySelector('[data-close]').onclick=()=>{dialog.close();dialog.remove();};
       document.body.append(dialog);dialog.showModal();return;
     }

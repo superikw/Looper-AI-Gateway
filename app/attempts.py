@@ -81,11 +81,50 @@ class Attempt:
     usage: dict = field(default_factory=dict)
     error_message: str | None = None
     log_id: int | None = None
+    retry_reason: str | None = None
+    preview_stop_reason: str | None = None
+    response_headers_ms: int | None = None
+    preview_elapsed_ms: int | None = None
+    failure_event_ms: int | None = None
+    headers_at: float | None = None
+
+    def received_headers(self):
+        self.headers_at = time.monotonic()
+        self.response_headers_ms = round((self.headers_at - self.started) * 1000)
+
+    def observe_failure(self, observed_at=None):
+        if self.failure_event_ms is None and self.headers_at is not None:
+            self.failure_event_ms = max(
+                0, round(((observed_at or time.monotonic()) - self.headers_at) * 1000)
+            )
+
+    def observe_preview(self, preview):
+        if preview is not None:
+            self.preview_stop_reason = preview.stop_reason
+            self.preview_elapsed_ms = preview.elapsed_ms
+            if preview.failure_at is not None:
+                self.observe_failure(preview.failure_at)
 
     def finish(self, category, decision, *, result=None, exc=None):
         if self.decision is not None:
             return
         self.category, self.decision = category, decision
+        if category in {"sse_business", "upstream_business", "upstream_http"}:
+            self.observe_failure()
+        if category in {"proxy_transport", "client_cancelled", "gateway_internal"}:
+            self.retry_reason = (
+                "proxy_transport_no_retry"
+                if category == "proxy_transport"
+                else category
+            )
+        elif category and self.retry_reason is None:
+            self.retry_reason = {
+                "proxy_transport": "proxy_transport_no_retry",
+                "network_transport": "unsafe_transport_retry",
+                "client_cancelled": "client_cancelled",
+                "gateway_internal": "gateway_internal",
+                "local_capacity": "local_capacity",
+            }.get(category, self.preview_stop_reason or "response_already_forwarded")
         self.status_code = (
             getattr(exc, "status_code", None)
             or (
@@ -119,10 +158,18 @@ class Attempt:
                 getattr(exc, "transport_exception_type", None)
             )
         self.elapsed = round((time.monotonic() - self.started) * 1000)
+        self.emit("upstream_attempt")
+
+    def stop_retry(self, reason):
+        self.retry_reason = reason
+        self.decision = "return_error"
+        self.emit("upstream_retry_stopped")
+
+    def emit(self, event):
         print(
             json.dumps(
                 {
-                    "event": "upstream_attempt",
+                    "event": event,
                     **self.row(),
                     "display_request_id": display_request_id(
                         self.trace.id, self.number - 1
@@ -148,6 +195,11 @@ class Attempt:
             upstream_error_code=self.error_code,
             transport_exception_type=self.transport_type,
             retry_decision=self.decision,
+            retry_reason=self.retry_reason,
+            preview_stop_reason=self.preview_stop_reason,
+            response_headers_ms=self.response_headers_ms,
+            preview_elapsed_ms=self.preview_elapsed_ms,
+            failure_event_ms=self.failure_event_ms,
             elapsed_ms=self.elapsed,
         )
 
@@ -194,6 +246,7 @@ def finish_response(response, category=None, decision="return", result=None, exc
     attempt = response_attempt(response)
     if attempt:
         attempt.trace.final_attempt = attempt
+        attempt.observe_preview(response.extensions.get("gateway_preview"))
         if not attempt.request_id and isinstance(result, dict):
             for source in (result, result.get("error"), result.get("upstream")):
                 if isinstance(source, dict):
@@ -201,6 +254,17 @@ def finish_response(response, category=None, decision="return", result=None, exc
                     if attempt.request_id:
                         break
         attempt.finish(category, decision, result=result, exc=exc)
+
+
+def observe_failure_event(response, event):
+    attempt = response_attempt(response)
+    if attempt and isinstance(event, dict):
+        value = event.get("response")
+        if event.get("type") in {"error", "response.failed", "response.cancelled"} or (
+            isinstance(value, dict)
+            and (value.get("error") or value.get("status") in {"failed", "cancelled"})
+        ):
+            attempt.observe_failure()
 
 
 def result_category(response, result):

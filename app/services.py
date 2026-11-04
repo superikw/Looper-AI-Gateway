@@ -19,6 +19,7 @@ from app.attempts import (
     RequestTrace,
     current_trace,
     finish_response,
+    observe_failure_event,
     result_category,
     safe_identifier,
 )
@@ -276,9 +277,13 @@ async def open_upstream(
                 502, "upstream credential does not contain a ChatGPT account ID"
             )
         diagnostic = trace.begin(None, path, payload.get("model"))
+        diagnostic.retry_reason = "non_pool_auth"
         try:
             response = await send(bearer, account)
+            diagnostic.received_headers()
             diagnostic.http_status = response.status_code
+            if response.status_code >= 400:
+                diagnostic.observe_failure()
             diagnostic.request_id = request_id(response)
             response.extensions["gateway_attempt"] = diagnostic
             return response
@@ -291,18 +296,33 @@ async def open_upstream(
     excluded: set[int] = set()
     last_response = None
     last_error = None
-    attempts = (
-        1
+    restriction = (
+        "bound_account"
         if upstream_credential_id is not None
-        or payload.get("previous_response_id")
-        or payload.get("conversation")
-        else settings.upstream_max_attempts
+        else "stateful_request"
+        if payload.get("previous_response_id") or payload.get("conversation")
+        else None
     )
+    attempts = 1 if restriction else settings.upstream_max_attempts
     deadline = (
         asyncio.get_running_loop().time() + settings.upstream_capacity_wait_seconds
     )
     retry_budget = RetryBudget()
     pending_delay = 0.0
+
+    def retry_reason(delay, eligible_reason):
+        return restriction or (
+            eligible_reason
+            if delay is not None
+            else retry_budget.reason or "attempt_limit"
+        )
+
+    def return_last(reason):
+        previous = last_response.extensions.get("gateway_attempt")
+        if previous is not None:
+            previous.stop_retry(reason)
+        return last_response
+
     for attempt in range(attempts):
         if pending_delay:
             await sleep_retry(pending_delay)
@@ -313,14 +333,14 @@ async def open_upstream(
             )
         except TimeoutError:
             if last_response is not None:
-                return last_response
+                return return_last("scheduler_timeout")
             trace.begin(None, path, payload.get("model")).finish(
                 "local_capacity", "reject"
             )
             raise HTTPException(503, "upstream account scheduler is busy") from None
         except HTTPException as exc:
             if last_response is not None:
-                return last_response
+                return return_last("no_available_account")
             trace.begin(None, path, payload.get("model")).finish(
                 "local_capacity", "reject", exc=exc
             )
@@ -331,6 +351,7 @@ async def open_upstream(
             break
         cid = lease.credential_id
         diagnostic = trace.begin(cid, path, payload.get("model"))
+        diagnostic.retry_reason = restriction
         excluded.add(cid)
         response = None
         handed_off = False
@@ -365,6 +386,9 @@ async def open_upstream(
                     if attempt < attempts - 1
                     else None
                 )
+                diagnostic.retry_reason = retry_reason(
+                    pending_delay, "credential_unavailable"
+                )
                 diagnostic.finish(
                     "upstream_http",
                     "retry_next_account"
@@ -392,6 +416,7 @@ async def open_upstream(
                     if attempt < attempts - 1
                     else None
                 )
+                diagnostic.retry_reason = retry_reason(pending_delay, "local_capacity")
                 diagnostic.finish(
                     "local_capacity",
                     "retry_next_account"
@@ -420,6 +445,9 @@ async def open_upstream(
                         if attempt < attempts - 1
                         else None
                     )
+                    diagnostic.retry_reason = retry_reason(
+                        pending_delay, "connect_failure"
+                    )
                     diagnostic.finish(
                         "network_transport",
                         "retry_next_account"
@@ -434,38 +462,53 @@ async def open_upstream(
                     continue
                 diagnostic.finish("network_transport", "return_error", exc=error)
                 raise error from None
+            diagnostic.received_headers()
             diagnostic.http_status = response.status_code
+            if response.status_code >= 400:
+                diagnostic.observe_failure()
             diagnostic.request_id = request_id(response)
             response.extensions["gateway_attempt"] = diagnostic
             response.extensions["gateway_credential_id"] = cid
             response.extensions["gateway_account_lease"] = lease
             response.stream = LeasedStream(response.stream, lease)
             if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
-                if (
-                    settings.sse_early_retry
-                    and (raw_body is None or native)
-                    and path in ("/v1/responses", "/v1/chat/completions")
-                    and response.status_code == 200
-                    and (
-                        not response.headers.get("content-type", "").strip()
-                        or "text/event-stream"
-                        in response.headers.get("content-type", "").lower()
-                        or "application/json"
-                        in response.headers.get("content-type", "").lower()
-                    )
-                ):
+                content_type = response.headers.get("content-type", "").strip().lower()
+                preview_ineligible = (
+                    "early_retry_disabled"
+                    if not settings.sse_early_retry
+                    else "path_not_eligible"
+                    if (raw_body is not None and not native)
+                    or path not in ("/v1/responses", "/v1/chat/completions")
+                    else "http_status_not_eligible"
+                    if response.status_code != 200
+                    else "unsupported_content_type"
+                    if content_type
+                    and "text/event-stream" not in content_type
+                    and "application/json" not in content_type
+                    else None
+                )
+                diagnostic.retry_reason = restriction or preview_ineligible
+                if preview_ineligible is None:
                     preview = Preview(response, strict=not native)
                     response.extensions["gateway_preview"] = preview
-                    failure = await preview.scan(
-                        settings.sse_preview_max_events,
-                        settings.sse_preview_max_bytes,
-                        settings.sse_preview_max_seconds,
-                    )
+                    try:
+                        failure = await preview.scan(
+                            settings.sse_preview_max_events,
+                            settings.sse_preview_max_bytes,
+                            settings.sse_preview_max_seconds,
+                        )
+                    finally:
+                        diagnostic.observe_preview(preview)
+                    diagnostic.retry_reason = restriction or preview.stop_reason
                     delay = (
                         retry_budget.reserve(attempt + 1, retry_after(response))
                         if failure is not None and attempt < attempts - 1
                         else None
                     )
+                    if failure is not None:
+                        diagnostic.retry_reason = retry_reason(
+                            delay, "retryable_business_error"
+                        )
                     if failure is not None and delay is not None:
                         diagnostic.request_id = (
                             diagnostic.request_id or upstream_request_id(failure)
@@ -521,10 +564,15 @@ async def open_upstream(
                 if native:
                     preview = Preview(response)
                     response.extensions["gateway_preview"] = preview
-                    error_body = await preview.read_body(
-                        settings.sse_preview_max_bytes, settings.sse_preview_max_seconds
-                    )
+                    try:
+                        error_body = await preview.read_body(
+                            settings.sse_preview_max_bytes,
+                            settings.sse_preview_max_seconds,
+                        )
+                    finally:
+                        diagnostic.observe_preview(preview)
                     if error_body is None:
+                        diagnostic.retry_reason = restriction or preview.stop_reason
                         handed_off = True
                         return response
                 else:
@@ -543,6 +591,7 @@ async def open_upstream(
             diagnostic.request_id = diagnostic.request_id or upstream_request_id(
                 error_result
             )
+            diagnostic.observe_failure()
             # Overload is model/business pressure, not a long account ban.
             if response.status_code in (401, 403) or should_cooldown_for_result(
                 error_result
@@ -552,6 +601,11 @@ async def open_upstream(
                 retry_budget.reserve(attempt + 1, retry_after(response))
                 if attempt < attempts - 1 and not permanent_failure(error_result)
                 else None
+            )
+            diagnostic.retry_reason = (
+                restriction or "permanent_error"
+                if permanent_failure(error_result)
+                else retry_reason(delay, "retryable_http_error")
             )
             diagnostic.finish(
                 "upstream_http",
@@ -607,7 +661,7 @@ async def open_upstream(
                 else:
                     await lease.release()
     if last_response is not None:
-        return last_response
+        return return_last("no_available_account")
     if last_error is not None:
         raise last_error
     raise HTTPException(
@@ -683,10 +737,12 @@ async def iter_upstream_events(response: httpx.Response):
 
             if preview.body_format == "json":
                 body = b"".join([chunk async for chunk in replay()])
-                yield {
+                event = {
                     "type": "response.completed",
                     "response": decode_upstream_body(response, body),
                 }
+                observe_failure_event(response, event)
+                yield event
                 return
             source = preview_lines(replay())
         else:
@@ -696,11 +752,13 @@ async def iter_upstream_events(response: httpx.Response):
                 event = decode_sse_data(lines)
                 lines = []
                 if event is not None:
+                    observe_failure_event(response, event)
                     yield event
             elif line.startswith("data:"):
                 lines.append(line[5:].removeprefix(" "))
         event = decode_sse_data(lines)
         if event is not None:
+            observe_failure_event(response, event)
             yield event
     except httpx.RequestError as exc:
         raise network_error(exc) from None

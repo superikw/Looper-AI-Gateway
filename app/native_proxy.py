@@ -58,7 +58,7 @@ def forwarding_headers(headers, *, response=False):
 class ResponseObserver:
     """Bounded, best-effort inspection; parsing never controls forwarded bytes."""
 
-    def __init__(self, content_type, inspect_terminal=True):
+    def __init__(self, content_type, inspect_terminal=True, on_failure=None):
         self.kind = "sse" if "text/event-stream" in content_type.lower() else None
         self.buffer = b""
         self.skipping = False
@@ -67,6 +67,11 @@ class ResponseObserver:
         self.terminal = False
         self.inspect_terminal = inspect_terminal
         self.result = {}
+        self.on_failure = on_failure
+
+    def observe_failure(self):
+        if self.on_failure is not None:
+            self.on_failure()
 
     def accept(self, value):
         if not isinstance(value, dict):
@@ -77,6 +82,8 @@ class ResponseObserver:
             for key in ("id", "status", "request_id", "error")
             if key in value
         }
+        if value.get("error") or value.get("status") in ("failed", "cancelled"):
+            self.observe_failure()
         usage = value.get("usage")
         if isinstance(usage, dict):
             self.result["usage"] = {
@@ -108,6 +115,7 @@ class ResponseObserver:
             self.terminal = True
             self.accept(value.get("response"))
             if kind in ("response.failed", "response.cancelled"):
+                self.observe_failure()
                 self.result["status"] = "failed"
                 self.result.setdefault("error", {"message": "upstream response failed"})
         elif kind == "error":
@@ -204,8 +212,11 @@ async def native_to_upstream(path, payload, body, request, db, api_key, active_i
     )
     cid = response.extensions.get("gateway_credential_id")
     rid = request_id(response)
+    attempt = response.extensions.get("gateway_attempt")
     observer = ResponseObserver(
-        response.headers.get("content-type", ""), path == "/v1/responses"
+        response.headers.get("content-type", ""),
+        path == "/v1/responses",
+        on_failure=attempt.observe_failure if attempt is not None else None,
     )
     state = {
         "recorded": False,

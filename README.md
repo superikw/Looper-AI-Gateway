@@ -363,7 +363,7 @@ RPM 历史和并发预约在同一主机的 worker 间共享，重启不会清�
 
 上游缺少 `Content-Type` 时也在同一预读取预算内识别正文格式，兼容 SSE 和普通 JSON，保留已读字节。JSON 使用独立业务错误分类，不误当作 SSE 解析；若直到预读取边界之后才识别出正文格式，继续正常消费，不重新开启重试窗口。两种下游接口的流式与非流式请求均适用。
 
-只有在上述边界内遇到明确早期失败，且错误代码在 `overloaded_error`、`server_overloaded`、`unavailable`、`service_unavailable`、`server_unavailable`、`temporarily_unavailable` 白名单中，或错误消息完整匹配 `Our servers are currently overloaded. Please try again later.` / `The service is temporarily unavailable. Please try again later.`，才允许切换账号。相同的明确 JSON 业务失败也可在有界检查完成后切号；普通 JSON 成功响应与其他错误不因此重试。失败响应自身包含输出时也不重放。HTTP 错误、可重试连接失败和早期业务失败共用 `UPSTREAM_MAX_ATTEMPTS` 和已尝试账号集合；固定 Key 不跨账号，用户路由限制继续生效。每次切换前关闭旧连接并释放并发租约，已经消耗的 RPM 不退还。无备用账号或次数耗尽时保留最后有价值的上游错误及请求 ID。
+只有在上述边界内遇到明确早期失败，且错误代码在 `overloaded_error`、`server_overloaded`、`server_is_overloaded`、`unavailable`、`service_unavailable`、`server_unavailable`、`temporarily_unavailable` 白名单中，或错误消息完整匹配 `Our servers are currently overloaded. Please try again later.` / `The service is temporarily unavailable. Please try again later.`，才允许切换账号。`server_is_overloaded` 不依赖错误文案，兼容其伴随类型 `service_unavailable_error`；不将该类型下的任意未知错误一律重试。相同的明确 JSON 业务失败也可在有界检查完成后切号；普通 JSON 成功响应与其他错误不因此重试。失败响应自身包含输出时也不重放。HTTP 错误、可重试连接失败和早期业务失败共用 `UPSTREAM_MAX_ATTEMPTS` 和已尝试账号集合；固定 Key 不跨账号，用户路由限制继续生效。每次切换前关闭旧连接并释放并发租约，已经消耗的 RPM 不退还。无备用账号或次数耗尽时保留最后有价值的上游错误及请求 ID。
 
 下游响应开始、预读取达到阈值或已观察到有意义输出后，不再透明切号。非流式下游请求也遵守相同的上游输出边界。其他原始透传接口、图像生成及编辑不增加 SSE 重试。读写故障不重放；只有建立连接阶段的特定错误可按已有预算切号。重试不能保证前一个账号没有计算或计费，每次上游明确返回的用量只统计一次，失败尝试未返回的用量无法补算。
 
@@ -381,8 +381,27 @@ WARP 代理请求路径上的传输错误不会冷却账号或轮换重试，具
 gateway_request_id, display_request_id, retry_count, attempt, upstream_credential_id, path, model,
 upstream_http_status, upstream_request_id, failure_category,
 upstream_error_type, upstream_error_code, transport_exception_type,
-retry_decision, elapsed_ms
+retry_decision, retry_reason, preview_stop_reason,
+response_headers_ms, preview_elapsed_ms, failure_event_ms, elapsed_ms
 ```
+
+`retry_reason` 说明换号或停止重试的原因，`preview_stop_reason` 单独说明预读取为何结束。两者可以不同，例如带会话续接字段时，即使早期识别到可重试错误，也会保留 `stateful_request` 和 `retryable_failure`。后台“查看尝试”同时展示中文含义和原始代码。
+
+| 常见原因代码 | 含义 |
+| --- | --- |
+| `preview_timeout` / `preview_event_limit` / `preview_byte_limit` | 预读取达到时间 / 事件数 / 字节数上限，进入正常转发 |
+| `meaningful_output` / `unknown_event` | 已观察到输出、工具调用或未知事件，停止预读取并禁止重放 |
+| `stateful_request` / `bound_account` | 会话续接请求 / 固定绑定 Key，不跨账号 |
+| `non_retryable_error` | 错误不符合白名单，或属于永久错误 |
+| `attempt_limit` | 达到总尝试次数上限 |
+| `retry_after_exceeds_limit` / `backoff_budget_exhausted` | 上游要求的等待超过单次上限 / 累计退避预算不足 |
+| `early_retry_disabled` | 配置关闭早期业务失败重试 |
+| `no_available_account` / `scheduler_timeout` | 没有可用备用账号 / 等待备用账号超时 |
+| `retryable_business_error` / `retryable_http_error` | 早期业务失败 / HTTP 错误触发换号计划 |
+
+`response_headers_ms` 从本次尝试开始计时，包含取得凭证、容量准入及等待响应头的耗时；`preview_elapsed_ms` 仅计预读取本身；`failure_event_ms` 从收到响应头起计，表示网关第一次识别失败的时间，而非上游生成该事件的时间。流结束后才判定的缺少终止事件不伪造失败事件时间。历史记录与未观察到的字段保持空。若决定换号后调度发现无备用账号，数据库更新该次的最终处理原因为 `no_available_account`，控制台另输出 `upstream_retry_stopped` 元数据事件，不新增上游请求或用量日志。
+
+预读取窗口仍默认为 1 秒，不因单次请求总耗时超过 1 秒就扩大。先结合 `preview_stop_reason=preview_timeout` 与 `failure_event_ms` 确认失败是否通常晚于窗口，再按需要将 `SSE_PREVIEW_MAX_SECONDS` 调至有界的 3–5 秒；没有输出时等待首批数据的时间可能随之增加。出现输出或未知事件仍立即结束预读取，禁止已输出内容的透明重放。
 
 | `failure_category` | 含义 |
 | --- | --- |
@@ -673,6 +692,8 @@ curl -f http://127.0.0.1:34567/readyz
 账号池 SSE 修复引入 `upstream_attempts` 表、`usage_logs.gateway_request_id` 可空列及索引，启动时自动幂等迁移，旧日志与用量保留。项目也已包含用户路由、身份字段和下游限额功能；线上若尚无 `user_upstream_routes`，需连同相应代码与迁移一起核对和测试。不要手工在生产数据库执行 DDL。先在隔离目录用脱敏的数据副本及匹配密钥验证升级；勿把该副本连接到生产服务。
 
 原生 Responses 与逐次日志更新另外增加 `usage_logs.retry_count/is_final/upstream_http_status/failure_category/elapsed_ms` 及 `upstream_attempts.retry_count`，均为增量迁移。历史日志 `is_final` 默认为 true、重试次数保持空，保留原统计口径。Gateway 与 Admin 必须同时更新，避免新版逐次日志被旧后台重复计为用户请求。
+
+重试原因诊断增量增加 `upstream_attempts.retry_reason/preview_stop_reason/response_headers_ms/preview_elapsed_ms/failure_event_ms` 五个可空字段，启动自动幂等迁移。旧尝试链路与耗时保留，新诊断保持空，不推测历史请求未重试的原因。Gateway 和 Admin 使用相同版本；无需手工修改线上数据库。
 
 发布范围需特别核对：此前下游限额功能将所有新旧用户的默认并发设为 2，可能新增 429；从不含该功能的旧版本升级时，需要根据实际负载核对策略。原生转发和逐次日志更新不调整该限额，也未增加账号＋模型健康避让。
 
