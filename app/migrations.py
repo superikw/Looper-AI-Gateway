@@ -173,6 +173,7 @@ async def initialize_database() -> None:
             "response_headers_ms": "INTEGER",
             "preview_elapsed_ms": "INTEGER",
             "failure_event_ms": "INTEGER",
+            "preview_stats": "JSON",
         }.items():
             if field not in attempt_columns:
                 await conn.execute(

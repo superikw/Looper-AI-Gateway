@@ -373,6 +373,7 @@ async def test_attempt_diagnostics_migration_preserves_existing_chain():
         "response_headers_ms",
         "preview_elapsed_ms",
         "failure_event_ms",
+        "preview_stats",
     )
     async with engine.begin() as conn:
         for field in fields:
@@ -387,3 +388,40 @@ async def test_attempt_diagnostics_migration_preserves_existing_chain():
         assert row.upstream_error_code == "server_is_overloaded"
         assert row.elapsed_ms == 3606 and row.retry_decision == "return"
         assert all(getattr(row, field) is None for field in fields)
+
+
+async def test_preview_stats_upgrade_preserves_previous_retry_diagnostics():
+    from sqlalchemy import select
+
+    from app.db import AsyncSessionLocal
+    from app.models import UpstreamAttempt
+
+    async with AsyncSessionLocal() as db:
+        db.add(
+            UpstreamAttempt(
+                gateway_request_id="prior-diagnostic-request",
+                attempt=1,
+                retry_count=0,
+                path="/v1/responses",
+                retry_decision="return",
+                retry_reason="preview_byte_limit",
+                preview_stop_reason="preview_byte_limit",
+                preview_elapsed_ms=25,
+                response_headers_ms=1447,
+                failure_event_ms=11488,
+                elapsed_ms=13040,
+            )
+        )
+        await db.commit()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("ALTER TABLE upstream_attempts DROP COLUMN preview_stats")
+        )
+    await initialize_database()
+    await initialize_database()
+    async with AsyncSessionLocal() as db:
+        row = await db.scalar(select(UpstreamAttempt))
+        assert row.preview_stats is None
+        assert row.retry_reason == row.preview_stop_reason == "preview_byte_limit"
+        assert row.preview_elapsed_ms == 25 and row.response_headers_ms == 1447
+        assert row.failure_event_ms == 11488 and row.elapsed_ms == 13040

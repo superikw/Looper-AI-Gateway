@@ -382,7 +382,7 @@ gateway_request_id, display_request_id, retry_count, attempt, upstream_credentia
 upstream_http_status, upstream_request_id, failure_category,
 upstream_error_type, upstream_error_code, transport_exception_type,
 retry_decision, retry_reason, preview_stop_reason,
-response_headers_ms, preview_elapsed_ms, failure_event_ms, elapsed_ms
+response_headers_ms, preview_elapsed_ms, failure_event_ms, preview_stats, elapsed_ms
 ```
 
 `retry_reason` 说明换号或停止重试的原因，`preview_stop_reason` 单独说明预读取为何结束。两者可以不同，例如带会话续接字段时，即使早期识别到可重试错误，也会保留 `stateful_request` 和 `retryable_failure`。后台“查看尝试”同时展示中文含义和原始代码。
@@ -400,6 +400,19 @@ response_headers_ms, preview_elapsed_ms, failure_event_ms, elapsed_ms
 | `retryable_business_error` / `retryable_http_error` | 早期业务失败 / HTTP 错误触发换号计划 |
 
 `response_headers_ms` 从本次尝试开始计时，包含取得凭证、容量准入及等待响应头的耗时；`preview_elapsed_ms` 仅计预读取本身；`failure_event_ms` 从收到响应头起计，表示网关第一次识别失败的时间，而非上游生成该事件的时间。流结束后才判定的缺少终止事件不伪造失败事件时间。历史记录与未观察到的字段保持空。若决定换号后调度发现无备用账号，数据库更新该次的最终处理原因为 `no_available_account`，控制台另输出 `upstream_retry_stopped` 元数据事件，不新增上游请求或用量日志。
+
+`preview_stats` 记录已接纳进预读取缓冲的解压后正文数据，不包含响应头、请求正文或网络压缩大小；预读取结束后冻结，不随正常转发继续增长。后台“预读取数据”列可展开逐帧类型及大小：
+
+| 字段 | 含义 |
+| --- | --- |
+| `format` / `bytes_read` | 识别的正文格式及预读取字节数；未识别格式为 `unknown` |
+| `event_count` | 有完整分隔符且成功解析为 JSON 对象的数据事件数，不含注释、`[DONE]` 或无效数据 |
+| `frame_count` / `max_frame_bytes` | 完整 SSE 帧数及最大完整帧大小；帧大小包含 `data:` 等 SSE 字段、注释和帧分隔符，以字节计 |
+| `comment_bytes` | 纯注释完整帧的累计大小，不保存心跳或注释内容 |
+| `frames` / `frames_omitted` | 按顺序保存最多 16 个完整帧的类型和大小，以及未展开帧数；总数仍完整累计 |
+| `incomplete_frame_bytes` / `incomplete_frame_type_hint` | 未完整成帧的已读字节数及类型提示；不代表最终完整帧大小 |
+
+已知事件类型保留名称，未知类型统一为 `unknown`；注释、结束标记、无效数据和无数据帧分别为 `comment`、`done_marker`、`invalid_data`、`no_data`，不保存上游任意字符串。未成帧类型仅从 `data:` 中首个 JSON 字段 `type` 的安全已知名称识别，或标注 `comment_prefix`，不能识别时为 `unknown`。例如 `65536 B / 0 个完整事件 / 未成帧 65536 B / response.created` 提示预读取可能截断在大型生命周期事件内部；事件尚未完整解析，最终类型与大小仍未知，不能把这 64 KiB 当成已输出的回答。普通 JSON 只统计字节数，不计为 SSE 事件。统计覆盖已接受字节里的完整帧，最后一块数据中可能还有决策停止点之后的帧；统计不会因此扩大预读取、增加等待或改变重放边界。
 
 预读取窗口仍默认为 1 秒，不因单次请求总耗时超过 1 秒就扩大。先结合 `preview_stop_reason=preview_timeout` 与 `failure_event_ms` 确认失败是否通常晚于窗口，再按需要将 `SSE_PREVIEW_MAX_SECONDS` 调至有界的 3–5 秒；没有输出时等待首批数据的时间可能随之增加。出现输出或未知事件仍立即结束预读取，禁止已输出内容的透明重放。
 
@@ -694,6 +707,8 @@ curl -f http://127.0.0.1:34567/readyz
 原生 Responses 与逐次日志更新另外增加 `usage_logs.retry_count/is_final/upstream_http_status/failure_category/elapsed_ms` 及 `upstream_attempts.retry_count`，均为增量迁移。历史日志 `is_final` 默认为 true、重试次数保持空，保留原统计口径。Gateway 与 Admin 必须同时更新，避免新版逐次日志被旧后台重复计为用户请求。
 
 重试原因诊断增量增加 `upstream_attempts.retry_reason/preview_stop_reason/response_headers_ms/preview_elapsed_ms/failure_event_ms` 五个可空字段，启动自动幂等迁移。旧尝试链路与耗时保留，新诊断保持空，不推测历史请求未重试的原因。Gateway 和 Admin 使用相同版本；无需手工修改线上数据库。
+
+预读取构成诊断另外增加可空 JSON 字段 `upstream_attempts.preview_stats`，同样在启动时自动迁移，旧记录保持空。更新 Gateway 与 Admin 后，新请求可展示上述预读取统计；无需调整现有预读取上限或手工回写历史日志。
 
 发布范围需特别核对：此前下游限额功能将所有新旧用户的默认并发设为 2，可能新增 429；从不含该功能的旧版本升级时，需要根据实际负载核对策略。原生转发和逐次日志更新不调整该限额，也未增加账号＋模型健康避让。
 

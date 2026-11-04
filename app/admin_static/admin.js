@@ -40,6 +40,11 @@ const retryReasons = {
 };
 const retryReason = value => value ? `${esc(retryReasons[value] || value)}<small>${esc(value)}</small>` : '—';
 const millis = value => value == null ? '—' : `${esc(value)} ms`;
+function previewStats(stats) {
+  if (!stats) return '—';
+  const frames = Array.isArray(stats.frames) ? stats.frames : [];
+  return `${esc(stats.bytes_read)} B · ${esc(stats.event_count)} 个完整事件<small>${esc(stats.format)} · ${esc(stats.frame_count)} 个完整帧 · 最大 ${esc(stats.max_frame_bytes)} B</small><small>纯注释帧 ${esc(stats.comment_bytes)} B</small>${stats.incomplete_frame_bytes ? `<small>未成帧 ${esc(stats.incomplete_frame_bytes)} B<br>类型提示 ${esc(stats.incomplete_frame_type_hint)}</small>` : ''}${frames.length ? `<details><summary>逐帧类型 / 大小</summary>${frames.map((frame,index)=>`<small>${index+1}. ${esc(frame.type)} · ${esc(frame.bytes)} B</small>`).join('')}${stats.frames_omitted ? `<small>另 ${esc(stats.frames_omitted)} 帧未展开</small>` : ''}</details>` : ''}`;
+}
 const table = (headers, rows) => `<div class="table-wrap"><table><thead><tr>${headers.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('') || `<tr><td colspan="${headers.length}" class="muted">暂无数据</td></tr>`}</tbody></table></div>`;
 const button = (action, label, id='') => `<button type="button" data-action="${action}" data-id="${esc(id)}">${label}</button>`;
 function modal(title, html, submit) {
@@ -153,7 +158,7 @@ async function act(action, id) {
       const rows=await api(`/api/logs/${id}/attempts`);
       const dialog=document.createElement('dialog');
       dialog.className='attempt-dialog';
-      dialog.innerHTML=`<h2>请求尝试链路</h2><p>${esc(rows[0]?.gateway_request_id || '无尝试记录')}</p><p class="muted">响应头耗时从本次尝试开始计算；失败事件时间从收到响应头开始计算，表示网关识别到失败的时间。历史记录缺少的诊断显示为 —。</p>${table(['重试次数','上游编号','HTTP','结果分类','错误类型 / 代码','传输异常类型','处理决定 / 原因','预读取结束原因','时间定位','总耗时','上游请求 ID'],rows.map(r=>`<tr><td>${r.retry_count ?? r.attempt-1}</td><td>${esc(r.upstream_credential_id ?? '—')}</td><td>${esc(r.upstream_http_status ?? '—')}</td><td>${esc(r.failure_category || '成功')}</td><td>${esc(r.upstream_error_type)} / ${esc(r.upstream_error_code)}</td><td>${esc(r.transport_exception_type)}</td><td>${esc(r.retry_decision)}<div>${retryReason(r.retry_reason)}</div></td><td>${retryReason(r.preview_stop_reason)}<small>预读取耗时 ${millis(r.preview_elapsed_ms)}</small></td><td>响应头 ${millis(r.response_headers_ms)}<small>失败事件 +${millis(r.failure_event_ms)}</small></td><td>${millis(r.elapsed_ms)}</td><td>${esc(r.upstream_request_id)}</td></tr>`))}<button type="button" data-close>关闭</button>`;
+      dialog.innerHTML=`<h2>请求尝试链路</h2><p>${esc(rows[0]?.gateway_request_id || '无尝试记录')}</p><p class="muted">响应头耗时从本次尝试开始计算；失败事件时间从收到响应头开始计算。预读取大小按解压后的正文统计，帧大小包含 SSE 分隔符；未成帧的类型仅为提示。历史缺失诊断显示为 —。</p>${table(['重试次数','上游编号','HTTP','结果分类','错误类型 / 代码','传输异常类型','处理决定 / 原因','预读取结束原因','预读取数据','时间定位','总耗时','上游请求 ID'],rows.map(r=>`<tr><td>${r.retry_count ?? r.attempt-1}</td><td>${esc(r.upstream_credential_id ?? '—')}</td><td>${esc(r.upstream_http_status ?? '—')}</td><td>${esc(r.failure_category || '成功')}</td><td>${esc(r.upstream_error_type)} / ${esc(r.upstream_error_code)}</td><td>${esc(r.transport_exception_type)}</td><td>${esc(r.retry_decision)}<div>${retryReason(r.retry_reason)}</div></td><td>${retryReason(r.preview_stop_reason)}<small>预读取耗时 ${millis(r.preview_elapsed_ms)}</small></td><td>${previewStats(r.preview_stats)}</td><td>响应头 ${millis(r.response_headers_ms)}<small>失败事件 ${r.failure_event_ms == null ? '—' : '+'+millis(r.failure_event_ms)}</small></td><td>${millis(r.elapsed_ms)}</td><td>${esc(r.upstream_request_id)}</td></tr>`))}<button type="button" data-close>关闭</button>`;
       dialog.querySelector('[data-close]').onclick=()=>{dialog.close();dialog.remove();};
       document.body.append(dialog);dialog.showModal();return;
     }

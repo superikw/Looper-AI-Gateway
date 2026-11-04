@@ -86,6 +86,7 @@ class Attempt:
     response_headers_ms: int | None = None
     preview_elapsed_ms: int | None = None
     failure_event_ms: int | None = None
+    preview_stats: dict | None = None
     headers_at: float | None = None
 
     def received_headers(self):
@@ -102,6 +103,7 @@ class Attempt:
         if preview is not None:
             self.preview_stop_reason = preview.stop_reason
             self.preview_elapsed_ms = preview.elapsed_ms
+            self.preview_stats = preview.stats.freeze()
             if preview.failure_at is not None:
                 self.observe_failure(preview.failure_at)
 
@@ -200,6 +202,7 @@ class Attempt:
             response_headers_ms=self.response_headers_ms,
             preview_elapsed_ms=self.preview_elapsed_ms,
             failure_event_ms=self.failure_event_ms,
+            preview_stats=self.preview_stats,
             elapsed_ms=self.elapsed,
         )
 

@@ -93,6 +93,11 @@ async def test_native_failover_logs_each_attempt_and_counts_user_once(
     assert attempts[0].failure_event_ms is not None
     assert attempts[0].response_headers_ms is not None
     assert attempts[0].preview_elapsed_ms is not None
+    assert attempts[0].preview_stats["event_count"] == 2
+    assert [frame["type"] for frame in attempts[0].preview_stats["frames"]] == [
+        "response.created",
+        "response.failed",
+    ]
     assert attempts[1].failure_event_ms is None
     async with AsyncSessionLocal() as db:
         saved = await db.get(ApiKey, key.id)
@@ -110,6 +115,7 @@ async def test_native_failover_logs_each_attempt_and_counts_user_once(
     assert chain[0]["preview_stop_reason"] == "retryable_failure"
     assert chain[0]["response_headers_ms"] == attempts[0].response_headers_ms
     assert chain[0]["failure_event_ms"] == attempts[0].failure_event_ms
+    assert chain[0]["preview_stats"] == attempts[0].preview_stats
 
 
 @pytest.mark.parametrize(
@@ -278,6 +284,9 @@ async def test_native_json_body_is_unchanged(client, key, pool):
     assert response.content == wire
     assert json.loads(state["requests"][0].content)["stream"] is False
     assert (await rows())[1][0].total_tokens == 3
+    metadata = (await rows())[0][0].preview_stats
+    assert metadata["format"] == "json" and metadata["bytes_read"] == len(wire)
+    assert metadata["frames"] == []
 
 
 @pytest.mark.parametrize("boundary", ["bytes", "time"])
@@ -313,6 +322,7 @@ async def test_compressed_native_response_is_not_double_decoded(client, key, poo
     response = await request(client)
     assert response.content == body and "content-encoding" not in response.headers
     assert (await rows())[1][0].total_tokens == 6
+    assert (await rows())[0][0].preview_stats["bytes_read"] == len(body)
 
 
 async def test_cancel_after_completed_keeps_successful_upstream_accounting(
@@ -691,3 +701,40 @@ async def test_failure_observation_does_not_include_trailing_stream_wait(
     diagnostic = (await rows())[0][0]
     assert diagnostic.elapsed_ms - diagnostic.failure_event_ms >= 60
     assert diagnostic.retry_reason == "meaningful_output"
+
+
+@pytest.mark.parametrize("content_type", [None, "text/event-stream"])
+async def test_large_lifecycle_preview_explains_byte_limit_and_preserves_stream(
+    client, key, pool, admin_client, content_type, capsys, monkeypatch
+):
+    _, state = pool
+    # Isolate the byte boundary from the fixture's intentionally tiny 20 ms
+    # timeout; parsing 64 KiB can exceed that under full-suite/browser load.
+    monkeypatch.setattr(settings, "sse_preview_max_seconds", 1.0)
+    created = life()
+    created["response"]["metadata"] = {"private": "secret-conversation-你好" * 5000}
+    prefix = ("data: " + json.dumps(created, ensure_ascii=False) + "\n\n").encode()
+    tail = ("data: " + json.dumps(failed()) + "\n\n").encode()
+    state["plans"][0] = httpx.Response(
+        200,
+        headers={"content-type": content_type} if content_type else {},
+        stream=Stream([prefix, 0.03, tail]),
+    )
+    response = await request(client)
+    assert response.content == prefix + tail and state["calls"] == [0]
+    attempts, logs, active = await rows()
+    assert len(attempts) == len(logs) == 1 and active == 0
+    diagnostic = attempts[0]
+    assert diagnostic.retry_reason == "preview_byte_limit"
+    metadata = diagnostic.preview_stats
+    assert metadata["format"] == "sse"
+    assert metadata["bytes_read"] == metadata["incomplete_frame_bytes"] == 65536
+    assert metadata["event_count"] == metadata["frame_count"] == 0
+    assert metadata["incomplete_frame_type_hint"] == "response.created"
+    assert "secret-conversation" not in capsys.readouterr().out
+    await admin_client.post(
+        "/api/login", json={"username": "root", "password": "root-password-123"}
+    )
+    chain = (await admin_client.get(f"/api/logs/{logs[0].id}/attempts")).json()
+    assert chain[0]["preview_stats"] == metadata
+    assert "secret-conversation" not in json.dumps(chain)

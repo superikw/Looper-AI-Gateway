@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.crypto import EncryptedText
@@ -261,5 +261,8 @@ class UpstreamAttempt(Base):
     response_headers_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     preview_elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failure_event_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preview_stats: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
     elapsed_ms: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

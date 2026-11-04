@@ -7,6 +7,7 @@ import time
 
 from fastapi import HTTPException
 
+from app.preview_stats import PreviewStats
 from app.protocol import ResponseAccumulator, decode_sse_data, response_failed
 from app.retry_policy import permanent_failure
 
@@ -88,6 +89,7 @@ class Preview:
         self.elapsed_ms = None
         self.started = None
         self.failure_at = None
+        self.stats = PreviewStats()
         self.body_format = (
             "sse"
             if "text/event-stream" in response.headers.get("content-type", "").lower()
@@ -122,6 +124,12 @@ class Preview:
         finally:
             self.elapsed_ms = round((time.monotonic() - self.started) * 1000)
             self.stop_reason = self.stop_reason or "preview_interrupted"
+            self.stats.freeze()
+
+    def buffer_chunk(self, chunk):
+        self.chunks.append(chunk)
+        self.observe_format(chunk)
+        self.stats.feed(chunk, self.body_format)
 
     def failure(self, result):
         self.failure_at = self.failure_at or time.monotonic()
@@ -155,9 +163,8 @@ class Preview:
                 self.exhausted = True
                 self.stop_reason = "stream_ended"
                 break
-            self.chunks.append(chunk)
+            self.buffer_chunk(chunk)
             size += len(chunk)
-            self.observe_format(chunk)
             if self.body_format == "json":
                 body = await self.read_body(
                     max_bytes, max(0, deadline - time.monotonic())
@@ -254,6 +261,7 @@ class Preview:
             if standalone:
                 self.elapsed_ms = round((time.monotonic() - self.started) * 1000)
                 self.stop_reason = self.stop_reason or "preview_interrupted"
+                self.stats.freeze()
 
     async def _read_body(self, max_bytes, max_seconds):
         deadline = time.monotonic() + max_seconds
@@ -274,7 +282,7 @@ class Preview:
                 self.exhausted = True
                 self.stop_reason = "body_complete"
                 return b"".join(self.chunks)
-            self.chunks.append(chunk)
+            self.buffer_chunk(chunk)
             size += len(chunk)
         self.boundary_reached = True
         self.stop_reason = self.stop_reason or "preview_byte_limit"
