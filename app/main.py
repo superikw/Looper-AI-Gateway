@@ -9,7 +9,7 @@ from typing import Any
 import anyio
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,7 +53,6 @@ from app.schemas import (
     UserOut,
 )
 from app.services import (
-    forward_raw_to_upstream,
     forward_to_upstream,
     parse_request_json,
     read_request_body,
@@ -469,6 +468,27 @@ async def admin_oauth_account(db: AsyncSession = Depends(get_db)):
 async def handle_proxy(path: str, request: Request, api_key: ApiKey, db: AsyncSession):
     model = None
     try:
+        if path == "/v1/responses" and settings.responses_passthrough:
+            from app.native_proxy import native_to_upstream
+            from app.protocol import reject_constant
+
+            body = await read_request_body(request, path=path)
+            try:
+                payload = json.loads(body, parse_constant=reject_constant)
+            except ValueError:
+                raise HTTPException(400, "invalid JSON request") from None
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("model"), str
+            ):
+                raise HTTPException(400, "model is required")
+            model = payload["model"]
+            await enforce_model_policy(db, validate_model(model))
+            active_id = await start_active_session(
+                db, api_key.user_id, api_key.id, path, model
+            )
+            return await native_to_upstream(
+                path, payload, body, request, db, api_key, active_id
+            )
         payload = validate_proxy_payload(path, await parse_request_json(request, path))
         model = validate_model(payload["model"])
         await enforce_model_policy(db, model)
@@ -563,17 +583,10 @@ async def handle_raw_proxy(
         active_id = await start_active_session(
             db, api_key.user_id, api_key.id, path, model or ""
         )
-        status_code, content, req_id, cid, content_type = await forward_raw_to_upstream(
-            path,
-            body,
-            request.method,
-            request.url.query,
-            {
-                "content-type": request.headers.get("content-type", ""),
-                "accept": request.headers.get("accept", "*/*"),
-            },
-            db,
-            api_key.upstream_credential_id,
+        from app.native_proxy import native_to_upstream
+
+        return await native_to_upstream(
+            path, payload, body, request, db, api_key, active_id
         )
     except HTTPException as exc:
         if "active_id" in locals():
@@ -590,17 +603,35 @@ async def handle_raw_proxy(
         )
         raise
 
-    await finish_active_session(
-        active_id, "completed" if status_code < 400 else "failed"
-    )
-    result = _raw_json(content, content_type or "")
-    await record_usage(db, api_key, path, model, status_code, result, req_id, cid)
-    headers = {}
-    if content_type:
-        headers["content-type"] = content_type
-    if req_id:
-        headers["x-request-id"] = req_id
-    return Response(content=content, status_code=status_code, headers=headers)
+    except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            if "active_id" in locals():
+                await finish_active_session(active_id, "cancelled")
+            await record_usage(
+                db,
+                api_key,
+                path,
+                model,
+                499,
+                {"error": {"message": "client disconnected"}},
+                None,
+            )
+        raise
+    except Exception as exc:
+        trace = current_trace.get()
+        internal_error(exc, trace.id if trace else "unknown")
+        if "active_id" in locals():
+            await finish_active_session(active_id, "failed")
+        await record_usage(
+            db,
+            api_key,
+            path,
+            model,
+            500,
+            {"error": {"message": "gateway internal error"}},
+            None,
+        )
+        raise
 
 
 @app.post("/v1/chat/completions")

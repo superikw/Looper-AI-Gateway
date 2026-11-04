@@ -38,9 +38,13 @@ Chat Completions 支持 `tools` / `tool_choice`、`parallel_tool_calls`、`tempe
 
 图像生成使用 `POST /v1/images/generations`，请求体遵循 OpenAI Images API（例如 `model`、`prompt`、`size`、`quality`、`n`），网关会将其转发到 Codex Images API 的 `/codex/images/generations`。`/v1/*` 的其他方法和路径在 API Key 鉴权后保留原始请求体与查询参数转发到对应的 Codex 路径；是否实际可用由上游账号和接口能力决定。
 
-`stream=true` 会增量输出文本、拒绝内容和函数参数。Chat Completions 以 `[DONE]` 结束，可通过 `stream_options.include_usage=true` 获取最终用量；Responses 保留具名事件格式。流式开始前发现错误会返回错误 HTTP 状态；开始后的错误通过 SSE 传递，并在用量日志中记录失败状态。
+默认 `RESPONSES_PASSTHROUGH=true`：原生 Responses 保留请求正文、模型名、未知字段、方法和查询参数，不强制修改 `stream`、`store`、instructions 或 include。响应按收到的正文增量转发，保留 SSE 心跳、`event/id/retry` 字段、未知事件、顺序及完成事件后的尾部数据；解析只旁路观察错误和用量，不重建正常事件。保留端到端请求/响应头，排除逐跳头、客户端鉴权、Cookie 和上游 Set-Cookie，并使用所选账号的上游凭证。HTTP 库处理压缩传输，转发解压后的正文时移除原 Content-Encoding 和 Content-Length，避免重复解压。其他原始透传路由也增量转发响应。
 
-不支持的参数和内容类型会返回 400，不会静默丢弃。当前不支持多候选结果（`n > 1`）、音频和 `store=true`。缺少 system/developer 指令时自动补充 `DEFAULT_INSTRUCTIONS`。具体模型、参数和工具是否可用仍取决于上游账号与 Codex backend。
+原生模式不把 HTTP 200 内的业务失败改写为 HTTP 502：客户端收到原始状态与错误正文/事件；日志分别记录上游 HTTP 状态及观察到的业务失败。传输中断后关闭连接，不伪造成功终止事件。Chat Completions 保留独立的协议适配层，以 `[DONE]` 结束，可通过 `stream_options.include_usage=true` 获取最终用量。需要旧版 Responses 协议转换时设置 `RESPONSES_PASSTHROUGH=false`；该模式会补齐/转换字段、重组事件，并将部分业务失败转换成 502。
+
+用量观察对单个尚未结束的事件或 JSON 正文最多保留 1 MiB；超限时继续原样转发，无法观测的用量不推算，也不会仅凭观察上限把请求判为上游失败。此上限不限制实际响应正文大小。
+
+Chat 及旧版 Responses 适配层不支持的参数和内容类型会返回 400，包括多候选结果（`n > 1`）、音频和 `store=true`；缺少指令时补充 `DEFAULT_INSTRUCTIONS`。原生 Responses 将这些字段交由上游处理，不保证上游支持任意参数。Codex CLI/Desktop 兼容范围是 HTTP Responses + SSE，未实现 WebSocket；模型与参数支持取决于账号和 Codex backend，实际客户端版本仍需端到端验收。
 
 协议转换参考：[OpenAI Responses 迁移说明](https://developers.openai.com/api/docs/guides/migrate-to-responses)、[Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)。这些文档描述公开 API 格式，不保证 ChatGPT backend 的全部行为。
 
@@ -351,13 +355,17 @@ RPM 历史和并发预约在同一主机的 worker 间共享，重启不会清�
 
 收到明确的上游 HTTP 401、403、429、500、502、503、504 时，未绑定请求会在尝试次数内改用其他账号，每个账号最多尝试一次。401/403 冷却 300 秒；429 优先遵循 Retry-After（秒数或 HTTP 日期，限制为 1 秒至 1 天），其他错误使用配置的冷却时间。并发错误不会缩短已有冷却；管理员可手动清除。`/readyz` 至少需要一个可用账号，全部冷却时返回 503。
 
+换号之间执行递增退避并添加少量随机延迟：默认基础 0.25 秒、单次最多 2 秒、累计退避等待最多 5 秒；`UPSTREAM_MAX_ATTEMPTS=3` 包含首次请求，因此最多重试两次。有效 `Retry-After` 是最短等待时间，若它超过单次/累计等待上限则停止重试并保留原错误，不提前重试。累计上限限制退避等待，不是整条生成请求的总时限。明确的额度耗尽、计费或账号停用错误不自动换号；共享代理传输错误也不换号。Codex 自身可能重试，需要一并评估，网关上限不能限制客户端另起的新请求。
+
+请求含 `previous_response_id` 或 `conversation` 时禁用跨账号重试。依赖服务端续接状态时应固定绑定原账号；当前没有自动跨请求账号亲和映射。无状态的完整历史重放不受此限制。原生 HTTP 错误正文同样有字节和等待上限，无法在边界内完成检查时开始正常转发，不再透明换号。
+
 上游 HTTP 200 不代表生成成功。OAuth 账号池对 `/v1/responses` 和 `/v1/chat/completions` 的 SSE 响应先进行有界预读取：默认最多 8 个数据事件、65536 字节、1 秒，任一阈值达到后结束检查。只允许缓冲空的 `response.created` / `response.in_progress` 生命周期事件；观察到文本、拒绝、工具调用、其他输出或未知事件后立即结束检查。成功时按原顺序消费缓冲内容，事件不丢失、不重复。
 
-上游缺少 `Content-Type` 时也在同一预读取预算内识别正文格式，兼容 SSE 和普通 JSON，保留原始响应头及已读字节。JSON 不作为 SSE 业务失败切号；若直到预读取边界之后才识别出正文格式，继续正常消费，不重新开启重试窗口。两种下游接口的流式与非流式请求均适用。
+上游缺少 `Content-Type` 时也在同一预读取预算内识别正文格式，兼容 SSE 和普通 JSON，保留已读字节。JSON 使用独立业务错误分类，不误当作 SSE 解析；若直到预读取边界之后才识别出正文格式，继续正常消费，不重新开启重试窗口。两种下游接口的流式与非流式请求均适用。
 
-只有在上述边界内遇到明确早期失败，且错误代码为 `overloaded_error` / `server_overloaded`，或错误消息完整匹配 `Our servers are currently overloaded. Please try again later.`，才允许切换账号。失败响应自身包含输出时也不重放。HTTP 错误、可重试连接失败和 SSE 早期失败共用 `UPSTREAM_MAX_ATTEMPTS` 和已尝试账号集合；固定 Key 不跨账号，用户路由限制继续生效。每次切换前关闭旧连接并释放并发租约，已经消耗的 RPM 不退还。无备用账号或次数耗尽时保留最后有价值的上游错误及请求 ID。
+只有在上述边界内遇到明确早期失败，且错误代码在 `overloaded_error`、`server_overloaded`、`unavailable`、`service_unavailable`、`server_unavailable`、`temporarily_unavailable` 白名单中，或错误消息完整匹配 `Our servers are currently overloaded. Please try again later.` / `The service is temporarily unavailable. Please try again later.`，才允许切换账号。相同的明确 JSON 业务失败也可在有界检查完成后切号；普通 JSON 成功响应与其他错误不因此重试。失败响应自身包含输出时也不重放。HTTP 错误、可重试连接失败和早期业务失败共用 `UPSTREAM_MAX_ATTEMPTS` 和已尝试账号集合；固定 Key 不跨账号，用户路由限制继续生效。每次切换前关闭旧连接并释放并发租约，已经消耗的 RPM 不退还。无备用账号或次数耗尽时保留最后有价值的上游错误及请求 ID。
 
-下游响应开始、预读取达到阈值或已观察到有意义输出后，不再透明切号。非流式下游请求也遵守相同的上游输出边界。原始透传、图像生成及编辑不增加 SSE 重试。读写故障不重放；只有建立连接阶段的特定错误可按已有预算切号。重试不能保证前一个账号没有计算或计费，下游最终用量只统计一次，失败尝试未返回的用量无法补算。
+下游响应开始、预读取达到阈值或已观察到有意义输出后，不再透明切号。非流式下游请求也遵守相同的上游输出边界。其他原始透传接口、图像生成及编辑不增加 SSE 重试。读写故障不重放；只有建立连接阶段的特定错误可按已有预算切号。重试不能保证前一个账号没有计算或计费，每次上游明确返回的用量只统计一次，失败尝试未返回的用量无法补算。
 
 `overloaded` 不再被预设为所有账号都会遇到的共享故障，但本版仍不据此执行长期账号级冷却；HTTP 与 SSE 中的上述白名单错误采用相同规则，401/403 继续账号级冷却。“账号＋模型”的短窗口失败、避让和限量探测恢复尚未实现，作为独立改动交付；本版不保证调度优先避开历史 overloaded 账号。账号池也不保证不同账号支持完全相同的模型。
 
@@ -365,10 +373,12 @@ WARP 代理请求路径上的传输错误不会冷却账号或轮换重试，具
 
 ### 请求与尝试诊断
 
-每个 `/v1/` 请求生成 `x-gateway-request-id`，不采用客户端传入的值。请求日志保存该 ID，后台“查看尝试”可还原账号切换过程；已登录管理员也可查询 `/api/logs/{log_id}/attempts`。历史日志无 ID 时显示无尝试记录。每次尝试同时输出一行 `event=upstream_attempt` 的 JSON，字段包括：
+每个 `/v1/` 用户请求生成短 `x-gateway-request-id`，不采用客户端传入的值。同一次用户请求的全部上游尝试共用该 ID，每次尝试单独写一条请求日志，`retry_count` 从 0 递增。后台和控制台显示 `a1b2c3d4-e5f60718/0`、`a1b2c3d4-e5f60718/1`，并单独保留每次的上游请求 ID、HTTP 状态、业务结果、耗时和账号；本地拒绝记录没有上游 HTTP 状态。重试失败日志在等待下一账号前即写入，最终结果不重复生成同一条上游日志。
+
+用户请求计数和仪表盘请求数只累计一次，用量和费用累计每次上游明确返回的用量，未返回的用量不推算。后台“查看尝试”可还原完整链路；已登录管理员也可查询 `/api/logs/{log_id}/attempts`。历史日志与原 ID 不回写，未记录过的重试次数保持未知。每次尝试同时输出一行 `event=upstream_attempt` 的 JSON，字段包括：
 
 ```text
-gateway_request_id, attempt, upstream_credential_id, path, model,
+gateway_request_id, display_request_id, retry_count, attempt, upstream_credential_id, path, model,
 upstream_http_status, upstream_request_id, failure_category,
 upstream_error_type, upstream_error_code, transport_exception_type,
 retry_decision, elapsed_ms
@@ -378,6 +388,7 @@ retry_decision, elapsed_ms
 | --- | --- |
 | `upstream_http` | 上游 HTTP 错误 |
 | `sse_business` | HTTP 成功后的 SSE 业务失败 |
+| `upstream_business` | HTTP 成功后的 JSON 业务失败 |
 | `missing_terminal` | 流结束时缺少终止事件 |
 | `proxy_transport` / `network_transport` | 代理请求路径 / 非代理路径传输故障 |
 | `local_capacity` | 网关本地容量或账号调度不可用 |
@@ -505,7 +516,7 @@ Key 明文仅在创建时返回，数据库保存 SHA-256 摘要。删除采用�
 
 通过鉴权后的请求，包括参数错误和上游错误，都会计入请求次数。流式取消记录为 499；上游未返回的 token 用量无法精确补算。统计用于使用情况追踪，不是账单结算系统。
 
-账号的 `request_count` 表示被调度次数，包含重试和刷新失败；`failure_count` 表示触发冷却的失败次数。下游一次请求只计一次，日志关联最终使用或报错的账号，token 计入该账号。此前失败尝试未返回的用量无法补算。升级前的历史日志保留原数据，不会猜测账号归属；账号维度的统计从升级后开始累计。
+账号的 `request_count` 表示被调度次数，包含重试和刷新失败；`failure_count` 表示触发冷却的失败次数。下游一次请求只计一次，每次上游尝试均有独立日志并关联实际账号，明确返回的 token 分别计入相应账号。失败尝试未返回的用量无法补算。升级前的历史日志保留原数据，不会猜测账号归属或重试次数。
 
 管理员 HTTP 接口使用 `Authorization: Bearer <ADMIN_TOKEN>`。接口清单可在 `/docs` 查看；`manage.py` 直接访问数据库，不需要通过 HTTP 管理员鉴权。
 
@@ -571,7 +582,11 @@ curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
 | `UPSTREAM_TIMEOUT_SECONDS` | 上游 HTTP 超时，默认 120 秒 |
 | `UPSTREAM_PROXY_URL` | 可选 HTTP(S) 代理，作用于模型请求和 OAuth 换取/刷新；Docker Compose 固定设置为 `http://warp:1080` |
 | `UPSTREAM_MAX_ATTEMPTS` | 账号池每个请求最多尝试的不同账号数，默认 3，范围 1–10；固定绑定只尝试一个 |
-| `SSE_EARLY_RETRY` | 默认 true，OAuth 池启用有界早期 SSE overloaded 重试；false 可关闭新增重试行为 |
+| `RESPONSES_PASSTHROUGH` | 默认 true，原生 Responses 正文与 SSE 增量透传；false 使用旧版协议适配层 |
+| `UPSTREAM_RETRY_BASE_DELAY_SECONDS` | 换号退避基础延迟，默认 0.25 秒，范围 0–10 |
+| `UPSTREAM_RETRY_MAX_DELAY_SECONDS` | 单次退避等待上限，默认 2 秒，范围 0–60 |
+| `UPSTREAM_RETRY_MAX_WAIT_SECONDS` | 同一次用户请求累计退避等待上限，默认 5 秒，范围 0–120 |
+| `SSE_EARLY_RETRY` | 默认 true，OAuth 池启用有界早期 SSE/JSON 白名单业务失败重试；false 可关闭新增预读取重试 |
 | `SSE_PREVIEW_MAX_EVENTS` | 默认 8，范围 1–64；达到数据事件数后停止预读取 |
 | `SSE_PREVIEW_MAX_BYTES` | 默认 65536，范围 1024–262144，必须是 1024 的整数倍 |
 | `SSE_PREVIEW_MAX_SECONDS` | 默认 1，范围大于 0 且不超过 5 秒；超时保留正在读取的任务供正常转发 |
@@ -581,7 +596,7 @@ curl -sS -X DELETE --get http://127.0.0.1:34567/admin/models/blacklist \
 | `MAX_REQUEST_BYTES` | 普通请求体大小限制，默认 16777216 字节（16 MiB） |
 | `MAX_IMAGE_REQUEST_BYTES` | 包含图片输入的请求体大小限制（base64 图片会放大 JSON），默认 67108864 字节（64 MiB） |
 | `MODEL_CATALOG` | `/v1/models` 展示列表，默认 `gpt-6.1-sol`；不限制请求模型，留空返回空目录 |
-| `DEFAULT_INSTRUCTIONS` | 缺少指令时使用的默认提示 |
+| `DEFAULT_INSTRUCTIONS` | Chat 和旧版 Responses 适配层缺少指令时使用的默认提示；原生 Responses 不补充 |
 | `OAUTH_*` | OAuth 地址、客户端标识、回调地址和 PKCE 会话配置 |
 
 模型访问策略由数据库黑名单控制，默认全部放行。项目没有自动发现或选择“最新模型”的逻辑。
@@ -655,13 +670,17 @@ curl -f http://127.0.0.1:34567/readyz
 
 先在本地实现、测试和审查，再安排发布。核对 `git branch --show-current`、`git rev-parse HEAD`、`git status --short` 及线上两个应用容器的镜像 ID，保留未提交修改；不要在有本地修改时直接拉取覆盖。发布完整的已审查版本，不能只热拷贝 `services.py` 或替换运行中容器的文件。
 
-本次 schema 变更为新增 `upstream_attempts` 表、`usage_logs.gateway_request_id` 可空列及索引，启动时自动幂等迁移，旧日志与用量保留。当前工作区还包含用户路由、身份字段和下游限额等此前待提交改动；线上若尚无 `user_upstream_routes`，需连同相应代码与迁移一起核对和测试。不要手工在生产数据库执行 DDL。先在隔离目录用脱敏的数据副本及匹配密钥验证升级；勿把该副本连接到生产服务。
+账号池 SSE 修复引入 `upstream_attempts` 表、`usage_logs.gateway_request_id` 可空列及索引，启动时自动幂等迁移，旧日志与用量保留。项目也已包含用户路由、身份字段和下游限额功能；线上若尚无 `user_upstream_routes`，需连同相应代码与迁移一起核对和测试。不要手工在生产数据库执行 DDL。先在隔离目录用脱敏的数据副本及匹配密钥验证升级；勿把该副本连接到生产服务。
 
-发布范围需特别核对：此前下游限额功能将所有新旧用户的默认并发设为 2，可能新增 429；上线前根据实际负载确认该策略，或另行拆分发布。缺少 Content-Type 的兼容补丁不更改该限额或迁移，也未增加账号＋模型健康避让。
+原生 Responses 与逐次日志更新另外增加 `usage_logs.retry_count/is_final/upstream_http_status/failure_category/elapsed_ms` 及 `upstream_attempts.retry_count`，均为增量迁移。历史日志 `is_final` 默认为 true、重试次数保持空，保留原统计口径。Gateway 与 Admin 必须同时更新，避免新版逐次日志被旧后台重复计为用户请求。
 
-发布前保留 Gateway 和 Admin 的旧镜像 ID/固定标签、Compose、`.env`，在维护窗口停止两个应用服务并按上一节备份数据库及对应密钥。使用固定发布版本构建两个应用镜像，记录新镜像 ID；只重建应用服务，不更换 WARP、超时和请求限额。验证 Compose 配置后启动 Gateway，再启动 Admin，避免两个进程同时执行首次迁移。确认 `/healthz`、`/readyz`、后台登录与旧路由正常，再做经授权的模型冒烟请求，核对网关请求 ID、各次上游请求 ID、分类和最终一条用量记录。健康端点正常本身不能证明模型调用或客户端网络正常。
+发布范围需特别核对：此前下游限额功能将所有新旧用户的默认并发设为 2，可能新增 429；从不含该功能的旧版本升级时，需要根据实际负载核对策略。原生转发和逐次日志更新不调整该限额，也未增加账号＋模型健康避让。
+
+发布前保留 Gateway 和 Admin 的旧镜像 ID/固定标签、Compose、`.env`，在维护窗口停止两个应用服务并按上一节备份数据库及对应密钥。使用固定发布版本构建两个应用镜像，记录新镜像 ID；只重建应用服务，不更换 WARP、超时和请求限额。验证 Compose 配置后启动 Gateway，再启动 Admin，避免两个进程同时执行首次迁移。确认 `/healthz`、`/readyz`、后台登录与旧路由正常，再做经授权的模型冒烟请求，核对短请求 ID、从 0 起的重试次数、每次上游请求 ID、各次日志及一次用户计数。健康端点正常本身不能证明模型调用或客户端网络正常。
 
 行为回滚：将 `.env` 中 `SSE_EARLY_RETRY=false`，重建 Gateway 容器使配置生效，可关闭新增预读取切号，保留诊断和新增表；其他此前待提交功能不会因此回滚。整版回滚：停止两个应用，恢复已记录的旧镜像及对应配置，再按已验证的兼容方案启动。新增表/可空列无需在线删除，但旧代码是否兼容整个升级后的 schema 必须先用副本验证；未验证时使用升级前备份和匹配密钥离线恢复，恢复会丢失备份后新产生的数据。禁止在线删表或改库回滚。
+
+原生转发行为可用 `RESPONSES_PASSTHROUGH=false` 切回旧适配层，逐次日志和退避仍生效。若整版回滚到只理解单条用量日志的旧后台，应使用匹配备份或先验证统计兼容性，不能仅因增量列可以保留就假设统计结果也相同。
 
 ### 恢复备份
 

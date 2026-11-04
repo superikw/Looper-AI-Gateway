@@ -315,6 +315,14 @@ async def test_upgrade_adds_request_ids_without_changing_historical_usage(key):
             text("ALTER TABLE usage_logs DROP COLUMN gateway_request_id")
         )
         await conn.execute(text("DROP TABLE upstream_attempts"))
+        for field in (
+            "retry_count",
+            "is_final",
+            "upstream_http_status",
+            "failure_category",
+            "elapsed_ms",
+        ):
+            await conn.execute(text(f"ALTER TABLE usage_logs DROP COLUMN {field}"))
         await conn.execute(
             text(
                 "INSERT INTO usage_logs (api_key_id,user_id,path,status_code,prompt_tokens,completion_tokens,total_tokens,cost_usd,created_at) VALUES (:key,:user,'/v1/responses',200,4,3,7,0.25,CURRENT_TIMESTAMP)"
@@ -331,4 +339,7 @@ async def test_upgrade_adds_request_ids_without_changing_historical_usage(key):
             row.gateway_request_id is None
             and row.total_tokens == 7
             and row.cost_usd == 0.25
+            and row.is_final is True
+            and row.retry_count is None
+            and row.upstream_http_status is None
         )

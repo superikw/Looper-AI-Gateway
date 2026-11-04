@@ -57,6 +57,10 @@ async def require_api_key(
             detail="invalid or disabled api key",
         )
     user = await db.get(User, api_key.user_id)
+    from app.attempts import current_trace
+
+    if trace := current_trace.get():
+        trace.api_key = api_key
     # Old integrations may provision database rows directly. Public creation
     # APIs and the upgrade migration opt users into explicit route assignment.
     if user.routing_configured:

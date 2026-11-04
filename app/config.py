@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     upstream_max_attempts: int = Field(
         default=3, alias="UPSTREAM_MAX_ATTEMPTS", ge=1, le=10
     )
+    responses_passthrough: bool = Field(default=True, alias="RESPONSES_PASSTHROUGH")
+    upstream_retry_base_delay_seconds: float = Field(
+        default=0.25, alias="UPSTREAM_RETRY_BASE_DELAY_SECONDS", ge=0, le=10
+    )
+    upstream_retry_max_delay_seconds: float = Field(
+        default=2, alias="UPSTREAM_RETRY_MAX_DELAY_SECONDS", ge=0, le=60
+    )
+    upstream_retry_max_wait_seconds: float = Field(
+        default=5, alias="UPSTREAM_RETRY_MAX_WAIT_SECONDS", ge=0, le=120
+    )
     sse_early_retry: bool = Field(default=True, alias="SSE_EARLY_RETRY")
     sse_preview_max_events: int = Field(
         default=8, alias="SSE_PREVIEW_MAX_EVENTS", ge=1, le=64

@@ -98,9 +98,10 @@ async def pool(monkeypatch):
         db.add_all(accounts)
         await db.commit()
         ids = [a.id for a in accounts]
-    state = {"calls": [], "streams": [], "plans": {}, "active": []}
+    state = {"calls": [], "streams": [], "plans": {}, "active": [], "requests": []}
 
     async def handle(request):
+        state["requests"].append(request)
         index = int(request.headers["chatgpt-account-id"].split("-")[-1])
         state["calls"].append(index)
         async with AsyncSessionLocal() as db:
@@ -198,9 +199,9 @@ async def test_early_failure_switches_without_leaking_and_single_usage(
         a.gateway_request_id == result.headers["x-gateway-request-id"] for a in attempts
     )
     assert (
-        len(logs) == 1
-        and logs[0].total_tokens == 6
-        and logs[0].upstream_credential_id == ids[1]
+        len(logs) == 2
+        and logs[-1].total_tokens == 6
+        and logs[-1].upstream_credential_id == ids[1]
     )
     assert logs[0].gateway_request_id == attempts[0].gateway_request_id
     assert active == 0 and all(s.closed for s in state["streams"])
@@ -241,7 +242,13 @@ async def test_json_is_preserved_and_never_retried_as_sse(
 ):
     _, state = pool
     text = '普通 JSON\ndata: {"type":"response.failed"}\n\n'
-    body = failed()["response"] if failure else completed()["response"]
+    body = (
+        failed(error={"message": "ordinary JSON error", "code": "invalid_request"})[
+            "response"
+        ]
+        if failure
+        else completed()["response"]
+    )
     if not failure:
         body["output_text"] = text
     wire = (" \r\n" + json.dumps(body, ensure_ascii=False, indent=2)).encode()
@@ -256,7 +263,7 @@ async def test_json_is_preserved_and_never_retried_as_sse(
     assert response.status_code == (502 if failure else 200), response.text
     assert state["calls"] == [0]
     assert (
-        OVERLOADED in response.text
+        "ordinary JSON error" in response.text
         if failure
         else json.dumps(text, ensure_ascii=False)[1:-1] in response.text
     )
@@ -414,7 +421,7 @@ async def test_mixed_http_and_sse_share_total_budget_and_keep_last_error(
     assert state["calls"] == [0, 1]
     attempts, logs, active = await rows()
     assert [a.failure_category for a in attempts] == ["upstream_http", "sse_business"]
-    assert len(logs) == 1 and active == 0
+    assert len(logs) == 2 and active == 0
     assert attempts[-1].upstream_request_id == "request-1"
 
 
@@ -552,8 +559,8 @@ async def test_all_attempts_overloaded_keep_error_and_do_not_count_usage_twice(
     assert response.status_code == 502 and OVERLOADED in response.text
     assert state["calls"] == [0, 1, 2]
     attempts, logs, active = await rows()
-    assert len(attempts) == 3 and len(logs) == 1 and active == 0
-    assert logs[0].upstream_request_id == "request-2"
+    assert len(attempts) == 3 and len(logs) == 3 and active == 0
+    assert logs[-1].upstream_request_id == "request-2"
 
 
 async def test_streaming_failure_keeps_last_upstream_header_request_id(
@@ -698,7 +705,7 @@ async def test_uncaught_server_exception_message_is_sanitized(key, pool):
         with pytest.raises(GatewayInternalError) as caught:
             await request(strict_client)
     assert "private-conversation" not in str(caught.value)
-    assert "gw_" in str(caught.value)
+    assert "request_id=" in str(caught.value)
 
 
 @pytest.mark.parametrize("http_status", [200, 503])

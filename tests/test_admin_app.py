@@ -456,7 +456,18 @@ async def test_live_sessions_and_recently_finished_requests(
         return 200, {}, None, None
 
     monkeypatch.setattr("app.main.forward_to_upstream", forward)
-    monkeypatch.setattr("app.main.forward_raw_to_upstream", forward)
+
+    async def native(*args, **kwargs):
+        from fastapi.responses import Response
+
+        from app.activity import finish_active_session
+
+        entered.set()
+        await release.wait()
+        await finish_active_session(args[-1], "completed")
+        return Response(content=b"{}", media_type="application/json")
+
+    monkeypatch.setattr("app.native_proxy.native_to_upstream", native)
     payload = (
         {"model": "gpt-test", "input": "hello"}
         if path != "/v1/chat/completions"

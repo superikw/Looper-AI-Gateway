@@ -14,7 +14,7 @@ import psutil
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin_service import (
@@ -26,6 +26,7 @@ from app.admin_service import (
     verify_password,
 )
 from app.admin_upstreams import router as upstream_router
+from app.attempts import display_request_id
 from app.config import settings
 from app.db import AsyncSessionLocal, get_db
 from app.migrations import initialize_database
@@ -357,7 +358,9 @@ async def users(
             stats = (
                 await db.execute(
                     select(
-                        func.count(UsageLog.id),
+                        func.coalesce(
+                            func.sum(case((UsageLog.is_final.is_(True), 1), else_=0)), 0
+                        ),
                         func.coalesce(func.sum(UsageLog.total_tokens), 0),
                         func.coalesce(func.sum(UsageLog.cost_usd), 0),
                     ).where(
@@ -595,7 +598,9 @@ async def dashboard(
         row = (
             await db.execute(
                 select(
-                    func.count(UsageLog.id),
+                    func.coalesce(
+                        func.sum(case((UsageLog.is_final.is_(True), 1), else_=0)), 0
+                    ),
                     func.coalesce(func.sum(UsageLog.total_tokens), 0),
                     func.coalesce(func.sum(UsageLog.cost_usd), 0),
                 ).where(UsageLog.created_at >= start, UsageLog.created_at < end)
@@ -667,7 +672,15 @@ async def logs(
             "model": log.model,
             "path": log.path,
             "gateway_request_id": log.gateway_request_id,
+            "display_request_id": display_request_id(
+                log.gateway_request_id, log.retry_count
+            ),
             "status_code": log.status_code,
+            "retry_count": log.retry_count,
+            "is_final": log.is_final,
+            "upstream_http_status": log.upstream_http_status,
+            "failure_category": log.failure_category,
+            "elapsed_ms": log.elapsed_ms,
             "input_tokens": log.prompt_tokens,
             "output_tokens": log.completion_tokens,
             "total_tokens": log.total_tokens,

@@ -39,6 +39,7 @@ from app.protocol import (
     response_failed,
     validate_upstream_data,
 )
+from app.retry_policy import RetryBudget, permanent_failure, retry_after, sleep_retry
 from app.sse_preview import Preview, retryable_failure
 from app.token_utils import extract_account_id_from_token
 from app.upstreams import AccountLease, mark_account_failure, wait_for_account
@@ -46,6 +47,12 @@ from app.upstreams import AccountLease, mark_account_failure, wait_for_account
 
 def log_debug(event: str, **kwargs: Any) -> None:
     payload = {"event": event, **kwargs}
+    if trace := current_trace.get():
+        payload["gateway_request_id"] = trace.id
+        if trace.attempts:
+            current = trace.attempts[-1]
+            payload["retry_count"] = current.number - 1
+            payload["display_request_id"] = f"{trace.id}/{current.number - 1}"
     try:
         print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
     except Exception:
@@ -194,11 +201,11 @@ async def _send_upstream(
     if query:
         url = f"{url}?{query}"
     headers = {
-        "Authorization": f"Bearer {bearer}",
+        "authorization": f"Bearer {bearer}",
         "chatgpt-account-id": account,
-        "OpenAI-Beta": settings.upstream_openai_beta,
+        "openai-beta": settings.upstream_openai_beta,
         "originator": settings.oauth_originator,
-        "User-Agent": "pi (linux x86_64)",
+        "user-agent": "pi (linux x86_64)",
         "accept": (
             "application/json"
             if path.startswith("/v1/images/")
@@ -207,7 +214,7 @@ async def _send_upstream(
     }
     for name, value in (request_headers or {}).items():
         if value and name.lower() not in {"authorization", "host", "content-length"}:
-            headers[name] = value
+            headers[name.lower()] = value
     log_debug("upstream_request", path=path, model=body.get("model"))
     client = get_http_client()
     request_kwargs = {"content": raw_body} if raw_body is not None else {"json": body}
@@ -236,8 +243,9 @@ async def open_upstream(
     method: str = "POST",
     query: str = "",
     request_headers: dict[str, str] | None = None,
+    native: bool = False,
 ) -> httpx.Response:
-    body = {} if raw_body is not None else build_codex_request_body(path, payload)
+    body = payload if raw_body is not None else build_codex_request_body(path, payload)
 
     async def send(bearer: str, account: str) -> httpx.Response:
         # Keep the simple call shape for existing transports and test doubles;
@@ -284,12 +292,21 @@ async def open_upstream(
     last_response = None
     last_error = None
     attempts = (
-        1 if upstream_credential_id is not None else settings.upstream_max_attempts
+        1
+        if upstream_credential_id is not None
+        or payload.get("previous_response_id")
+        or payload.get("conversation")
+        else settings.upstream_max_attempts
     )
     deadline = (
         asyncio.get_running_loop().time() + settings.upstream_capacity_wait_seconds
     )
+    retry_budget = RetryBudget()
+    pending_delay = 0.0
     for attempt in range(attempts):
+        if pending_delay:
+            await sleep_retry(pending_delay)
+        pending_delay = 0.0
         try:
             lease = await wait_for_account(
                 upstream_credential_id, excluded, deadline, db.info.get("route_user_id")
@@ -343,20 +360,48 @@ async def open_upstream(
             except HTTPException as exc:
                 exc.upstream_credential_id = cid
                 last_error = exc
-                diagnostic.finish("upstream_http", "retry_next_account", exc=exc)
+                pending_delay = (
+                    retry_budget.reserve(attempt + 1)
+                    if attempt < attempts - 1
+                    else None
+                )
+                diagnostic.finish(
+                    "upstream_http",
+                    "retry_next_account"
+                    if pending_delay is not None
+                    else "return_error",
+                    exc=exc,
+                )
+                await diagnostic.persist_usage()
                 await mark_account_failure(
                     cid,
                     300
                     if exc.status_code == 401
                     else settings.upstream_failure_cooldown_seconds,
                 )
+                if pending_delay is None:
+                    break
                 continue
             try:
                 await lease.start_request(deadline)
             except HTTPException as exc:
                 exc.upstream_credential_id = cid
                 last_error = exc
-                diagnostic.finish("local_capacity", "return_error", exc=exc)
+                pending_delay = (
+                    retry_budget.reserve(attempt + 1)
+                    if attempt < attempts - 1
+                    else None
+                )
+                diagnostic.finish(
+                    "local_capacity",
+                    "retry_next_account"
+                    if pending_delay is not None
+                    else "return_error",
+                    exc=exc,
+                )
+                await diagnostic.persist_usage()
+                if pending_delay is None:
+                    break
                 continue
             try:
                 response = await send(bearer, account)
@@ -370,10 +415,22 @@ async def open_upstream(
                 if isinstance(
                     exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
                 ):
-                    diagnostic.finish(
-                        "network_transport", "retry_next_account", exc=error
+                    pending_delay = (
+                        retry_budget.reserve(attempt + 1)
+                        if attempt < attempts - 1
+                        else None
                     )
+                    diagnostic.finish(
+                        "network_transport",
+                        "retry_next_account"
+                        if pending_delay is not None
+                        else "return_error",
+                        exc=error,
+                    )
+                    await diagnostic.persist_usage()
                     last_error = error
+                    if pending_delay is None:
+                        break
                     continue
                 diagnostic.finish("network_transport", "return_error", exc=error)
                 raise error from None
@@ -386,62 +443,99 @@ async def open_upstream(
             if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
                 if (
                     settings.sse_early_retry
-                    and raw_body is None
+                    and (raw_body is None or native)
                     and path in ("/v1/responses", "/v1/chat/completions")
                     and response.status_code == 200
                     and (
                         not response.headers.get("content-type", "").strip()
                         or "text/event-stream"
                         in response.headers.get("content-type", "").lower()
+                        or "application/json"
+                        in response.headers.get("content-type", "").lower()
                     )
                 ):
-                    preview = Preview(response)
+                    preview = Preview(response, strict=not native)
                     response.extensions["gateway_preview"] = preview
                     failure = await preview.scan(
                         settings.sse_preview_max_events,
                         settings.sse_preview_max_bytes,
                         settings.sse_preview_max_seconds,
                     )
-                    if failure is not None and attempt < attempts - 1:
+                    delay = (
+                        retry_budget.reserve(attempt + 1, retry_after(response))
+                        if failure is not None and attempt < attempts - 1
+                        else None
+                    )
+                    if failure is not None and delay is not None:
                         diagnostic.request_id = (
                             diagnostic.request_id or upstream_request_id(failure)
                         )
                         diagnostic.finish(
-                            "sse_business", "retry_next_account", result=failure
+                            "upstream_business"
+                            if preview.body_format == "json"
+                            else "sse_business",
+                            "retry_next_account",
+                            result=failure,
                         )
                         # A buffered error snapshot survives closing the old socket.
                         last_response = httpx.Response(
                             200,
-                            headers={
-                                "content-type": "application/json",
-                                **(
-                                    {
-                                        "x-request-id": safe_identifier(
-                                            diagnostic.request_id
-                                        )
-                                    }
-                                    if safe_identifier(diagnostic.request_id)
-                                    else {}
-                                ),
-                            },
-                            json=failure,
+                            headers=(
+                                {
+                                    key: value
+                                    for key, value in response.headers.items()
+                                    if key.lower()
+                                    not in {"content-encoding", "content-length"}
+                                }
+                                if native
+                                else {
+                                    "content-type": "application/json",
+                                    **(
+                                        {
+                                            "x-request-id": safe_identifier(
+                                                diagnostic.request_id
+                                            )
+                                        }
+                                        if safe_identifier(diagnostic.request_id)
+                                        else {}
+                                    ),
+                                }
+                            ),
+                            **(
+                                {"content": b"".join(preview.chunks)}
+                                if native
+                                else {"json": failure}
+                            ),
                             extensions={
                                 "gateway_credential_id": cid,
                                 "gateway_attempt": diagnostic,
                             },
                         )
+                        await close_upstream(response)
+                        await diagnostic.persist_usage()
+                        pending_delay = delay
                         continue
                 handed_off = True
                 return response
             try:
-                await response.aread()
+                if native:
+                    preview = Preview(response)
+                    response.extensions["gateway_preview"] = preview
+                    error_body = await preview.read_body(
+                        settings.sse_preview_max_bytes, settings.sse_preview_max_seconds
+                    )
+                    if error_body is None:
+                        handed_off = True
+                        return response
+                else:
+                    error_body = await response.aread()
             except httpx.RequestError as exc:
                 error = network_error(exc)
                 error.upstream_credential_id = cid
                 diagnostic.finish(error.failure_category, "return_error", exc=error)
                 raise error from None
             try:
-                error_result = response.json()
+                error_result = json.loads(error_body)
             except ValueError:
                 error_result = {}
             if not isinstance(error_result, dict):
@@ -454,15 +548,39 @@ async def open_upstream(
                 error_result
             ):
                 await mark_account_failure(cid, cooldown_for_response(response))
+            delay = (
+                retry_budget.reserve(attempt + 1, retry_after(response))
+                if attempt < attempts - 1 and not permanent_failure(error_result)
+                else None
+            )
             diagnostic.finish(
                 "upstream_http",
-                "retry_next_account" if attempt < attempts - 1 else "return_error",
+                "retry_next_account" if delay is not None else "return_error",
                 result=error_result,
             )
-            if attempt == attempts - 1:
+            if delay is None:
                 handed_off = True
                 return response
-            last_response = response
+            last_response = (
+                httpx.Response(
+                    response.status_code,
+                    headers={
+                        key: value
+                        for key, value in response.headers.items()
+                        if key.lower() not in {"content-encoding", "content-length"}
+                    },
+                    content=error_body,
+                    extensions={
+                        "gateway_credential_id": cid,
+                        "gateway_attempt": diagnostic,
+                    },
+                )
+                if native
+                else response
+            )
+            await close_upstream(response)
+            await diagnostic.persist_usage()
+            pending_delay = delay
         except httpx.RequestError as exc:
             error = network_error(exc)
             error.upstream_credential_id = cid
@@ -757,8 +875,33 @@ async def record_usage(
     response_json: dict[str, Any],
     upstream_request_id: str | None,
     upstream_credential_id: int | None = None,
+    *,
+    attempt_override=None,
+    is_final: bool = True,
 ) -> None:
-    usage = response_json.get("usage") or {}
+    trace = current_trace.get()
+    attempt = attempt_override or (
+        (trace.final_attempt or (trace.attempts[-1] if trace.attempts else None))
+        if trace
+        else None
+    )
+    new_log = attempt is None or attempt.log_id is None
+    count_request = is_final and (trace is None or not trace.request_counted)
+    raw_usage = response_json.get("usage")
+    usage = (
+        {
+            key: value
+            for key, value in raw_usage.items()
+            if type(value) is int and value >= 0
+        }
+        if isinstance(raw_usage, dict)
+        else {}
+    )
+    if isinstance(raw_usage, dict):
+        for name in ("input_tokens_details", "prompt_tokens_details"):
+            details = raw_usage.get(name)
+            if isinstance(details, dict) and type(details.get("cached_tokens")) is int:
+                usage[name] = {"cached_tokens": max(0, details["cached_tokens"])}
     prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
     completion_tokens = int(
         usage.get("completion_tokens") or usage.get("output_tokens") or 0
@@ -766,7 +909,7 @@ async def record_usage(
     total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
     from app.pricing import ensure_model_price
 
-    price = await ensure_model_price(db, model)
+    price = await ensure_model_price(db, model) if is_final or total_tokens else None
     cost_usd = 0.0
     if price:
         details = (
@@ -791,15 +934,16 @@ async def record_usage(
         update(ApiKey)
         .where(ApiKey.id == api_key.id)
         .values(
-            request_count=ApiKey.request_count + 1,
-            prompt_tokens=ApiKey.prompt_tokens + prompt_tokens,
-            completion_tokens=ApiKey.completion_tokens + completion_tokens,
-            total_tokens=ApiKey.total_tokens + total_tokens,
+            request_count=ApiKey.request_count + int(count_request),
+            prompt_tokens=ApiKey.prompt_tokens + prompt_tokens * int(new_log),
+            completion_tokens=ApiKey.completion_tokens
+            + completion_tokens * int(new_log),
+            total_tokens=ApiKey.total_tokens + total_tokens * int(new_log),
         )
         .execution_options(synchronize_session=False)
     )
 
-    if upstream_credential_id is not None:
+    if upstream_credential_id is not None and new_log:
         await db.execute(
             update(UpstreamCredential)
             .where(UpstreamCredential.id == upstream_credential_id)
@@ -816,17 +960,22 @@ async def record_usage(
     if status_code >= 400:
         error = response_json.get("error") if isinstance(response_json, dict) else None
         if isinstance(error, dict):
-            error_message = error.get("message") or json.dumps(
-                error, ensure_ascii=False
-            )
+            error_message = str(
+                error.get("message") or json.dumps(error, ensure_ascii=False)
+            )[:2048]
         else:
             error_message = str(error) if error else None
 
-    db.add(
-        UsageLog(
+    if new_log:
+        log = UsageLog(
             api_key_id=api_key.id,
             user_id=api_key.user_id,
-            gateway_request_id=current_trace.get().id if current_trace.get() else None,
+            gateway_request_id=trace.id if trace else None,
+            retry_count=attempt.number - 1 if attempt else 0,
+            is_final=is_final,
+            upstream_http_status=attempt.http_status if attempt else None,
+            failure_category=attempt.category if attempt else None,
+            elapsed_ms=attempt.elapsed if attempt else None,
             path=path,
             model=model,
             status_code=status_code,
@@ -838,8 +987,18 @@ async def record_usage(
             error_message=error_message,
             cost_usd=cost_usd,
         )
-    )
+        db.add(log)
+        await db.flush()
+        log_id = log.id
+    else:
+        log = await db.get(UsageLog, attempt.log_id)
+        if log is not None and is_final:
+            log.is_final = True
     await db.commit()
+    if attempt is not None and new_log:
+        attempt.log_id = log_id
+    if trace is not None and count_request:
+        trace.request_counted = True
 
 
 IMAGE_REQUEST_PATHS = {

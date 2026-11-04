@@ -1,38 +1,55 @@
 """Bounded pre-output inspection. A timed-out read is retained, not cancelled."""
 
 import asyncio
+import json
 import re
 import time
 
+from fastapi import HTTPException
+
 from app.protocol import ResponseAccumulator, decode_sse_data, response_failed
+from app.retry_policy import permanent_failure
 
 _SEPARATOR = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 
 
 def retryable_failure(result):
     error = result.get("error")
-    if not isinstance(error, dict):
+    if not isinstance(error, dict) or permanent_failure(result):
         return False
     if any(result.get(key) for key in ("output", "output_text", "refusal")):
         return False
-    return (
-        error.get("code") in {"overloaded_error", "server_overloaded"}
-        or str(error.get("message", "")).strip().lower()
-        == "our servers are currently overloaded. please try again later."
-    )
+    codes = {
+        "overloaded_error",
+        "server_overloaded",
+        "unavailable",
+        "service_unavailable",
+        "server_unavailable",
+        "temporarily_unavailable",
+    }
+    return any(
+        isinstance(value, str) and value in codes
+        for value in (error.get("code"), error.get("type"))
+    ) or str(error.get("message", "")).strip().lower() in {
+        "our servers are currently overloaded. please try again later.",
+        "the service is temporarily unavailable. please try again later.",
+    }
 
 
 def lifecycle_only(event):
     if event.get("type") not in {"response.created", "response.in_progress"}:
         return False
     response = event.get("response") or {}
+    if not isinstance(response, dict):
+        return False
     return not any(
         response.get(key) for key in ("output", "output_text", "error", "refusal")
     )
 
 
 class Preview:
-    def __init__(self, response):
+    def __init__(self, response, *, strict=True):
+        self.strict = strict
         self.reader = self._chunks(response).__aiter__()
         self.chunks = []
         self.pending = None
@@ -87,26 +104,65 @@ class Preview:
             size += len(chunk)
             self.observe_format(chunk)
             if self.body_format == "json":
+                body = await self.read_body(
+                    max_bytes, max(0, deadline - time.monotonic())
+                )
+                if body is not None:
+                    try:
+                        result = json.loads(body)
+                    except ValueError:
+                        return None
+                    if (
+                        isinstance(result, dict)
+                        and response_failed(result)
+                        and retryable_failure(result)
+                    ):
+                        return result
                 return None
             buffer += chunk
             while (match := _SEPARATOR.search(buffer)) is not None:
                 frame, buffer = buffer[: match.start()], buffer[match.end() :]
                 lines = [
                     line[5:].removeprefix(" ")
-                    for line in frame.decode("utf-8", errors="replace").splitlines()
+                    for line in frame.decode("utf-8-sig", errors="replace").splitlines()
                     if line.startswith("data:")
                 ]
-                event = decode_sse_data(lines)
+                try:
+                    event = decode_sse_data(lines)
+                except HTTPException:
+                    if self.strict:
+                        raise
+                    return None
                 if event is None:
                     continue
                 count += 1
-                accumulator.add(event)
-                if accumulator.terminal and response_failed(accumulator.result()):
-                    return (
-                        accumulator.result()
-                        if retryable_failure(accumulator.result())
-                        else None
-                    )
+                if self.strict:
+                    accumulator.add(event)
+                    if accumulator.terminal and response_failed(accumulator.result()):
+                        return (
+                            accumulator.result()
+                            if retryable_failure(accumulator.result())
+                            else None
+                        )
+                else:
+                    kind = event.get("type")
+                    if kind in ("error", "response.failed"):
+                        result = (
+                            event.get("response")
+                            if kind == "response.failed"
+                            else {
+                                "error": event.get("error")
+                                or {
+                                    "code": event.get("code"),
+                                    "message": event.get("message"),
+                                }
+                            }
+                        )
+                        return (
+                            result
+                            if isinstance(result, dict) and retryable_failure(result)
+                            else None
+                        )
                 if not lifecycle_only(event):
                     return None
                 if count >= max_events:
@@ -133,6 +189,28 @@ class Preview:
             async for chunk in self.reader:
                 self.observe_format(chunk)
                 yield chunk
+
+    async def read_body(self, max_bytes, max_seconds):
+        """Bounded HTTP error inspection with the same lossless replay path."""
+        deadline = time.monotonic() + max_seconds
+        size = sum(map(len, self.chunks))
+        while size < max_bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.pending = asyncio.create_task(anext(self.reader, None))
+            done, _ = await asyncio.wait({self.pending}, timeout=remaining)
+            if not done:
+                break
+            chunk = self.pending.result()
+            self.pending = None
+            if chunk is None:
+                self.exhausted = True
+                return b"".join(self.chunks)
+            self.chunks.append(chunk)
+            size += len(chunk)
+        self.boundary_reached = True
+        return None
 
     async def close(self):
         if self.pending is not None:

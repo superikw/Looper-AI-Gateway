@@ -6,9 +6,9 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 import time
 import traceback
-import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
@@ -26,6 +26,17 @@ current_trace: ContextVar[RequestTrace | None] = ContextVar(
 
 class GatewayInternalError(RuntimeError):
     """Safe propagated failure for ASGI servers that log uncaught exceptions."""
+
+
+def new_request_id():
+    value = secrets.token_hex(8)
+    return value[:8] + "-" + value[8:]
+
+
+def display_request_id(request_id, retry_count):
+    if not request_id:
+        return None
+    return f"{request_id}/{retry_count}" if retry_count is not None else request_id
 
 
 def safe_identifier(value):
@@ -66,22 +77,59 @@ class Attempt:
     error_code: str | None = None
     transport_type: str | None = None
     elapsed: int = 0
+    status_code: int = 500
+    usage: dict = field(default_factory=dict)
+    error_message: str | None = None
+    log_id: int | None = None
 
     def finish(self, category, decision, *, result=None, exc=None):
         if self.decision is not None:
             return
         self.category, self.decision = category, decision
+        self.status_code = (
+            getattr(exc, "status_code", None)
+            or (
+                self.http_status
+                if self.http_status and self.http_status >= 400
+                else None
+            )
+            or {
+                "sse_business": 502,
+                "upstream_business": 502,
+                "missing_terminal": 502,
+                "sse_protocol": 502,
+                "client_cancelled": 499,
+                "gateway_internal": 500,
+                "local_capacity": 429,
+            }.get(category, 200 if category is None else 502)
+        )
+        self.usage = (result or {}).get("usage") or {}
         error = (result or {}).get("error")
         if isinstance(error, dict):
+            self.error_message = str(error.get("message") or "upstream request failed")[
+                :2048
+            ]
             self.error_type = safe_identifier(error.get("type"))
             self.error_code = safe_identifier(error.get("code"))
         if exc is not None:
+            self.error_message = str(getattr(exc, "detail", "upstream request failed"))[
+                :2048
+            ]
             self.transport_type = safe_identifier(
                 getattr(exc, "transport_exception_type", None)
             )
         self.elapsed = round((time.monotonic() - self.started) * 1000)
         print(
-            json.dumps({"event": "upstream_attempt", **self.row()}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "event": "upstream_attempt",
+                    **self.row(),
+                    "display_request_id": display_request_id(
+                        self.trace.id, self.number - 1
+                    ),
+                },
+                ensure_ascii=False,
+            ),
             flush=True,
         )
 
@@ -89,6 +137,7 @@ class Attempt:
         return dict(
             gateway_request_id=self.trace.id,
             attempt=self.number,
+            retry_count=self.number - 1,
             upstream_credential_id=self.cid,
             path=self.path,
             model=self.model,
@@ -102,11 +151,34 @@ class Attempt:
             elapsed_ms=self.elapsed,
         )
 
+    async def persist_usage(self):
+        if self.trace.api_key is None or self.log_id is not None:
+            return
+        from app.services import record_usage
+
+        with anyio.CancelScope(shield=True):
+            async with AsyncSessionLocal() as db:
+                await record_usage(
+                    db,
+                    self.trace.api_key,
+                    self.path,
+                    self.model,
+                    self.status_code,
+                    {"usage": self.usage, "error": {"message": self.error_message}},
+                    self.request_id,
+                    self.cid,
+                    attempt_override=self,
+                    is_final=False,
+                )
+
 
 @dataclass
 class RequestTrace:
-    id: str = field(default_factory=lambda: "gw_" + uuid.uuid4().hex)
+    id: str = field(default_factory=new_request_id)
     attempts: list[Attempt] = field(default_factory=list)
+    api_key: object | None = None
+    request_counted: bool = False
+    final_attempt: Attempt | None = None
 
     def begin(self, cid, path, model):
         attempt = Attempt(self, len(self.attempts) + 1, cid, path, model)
@@ -121,6 +193,7 @@ def response_attempt(response):
 def finish_response(response, category=None, decision="return", result=None, exc=None):
     attempt = response_attempt(response)
     if attempt:
+        attempt.trace.final_attempt = attempt
         if not attempt.request_id and isinstance(result, dict):
             for source in (result, result.get("error"), result.get("upstream")):
                 if isinstance(source, dict):
@@ -141,7 +214,12 @@ def result_category(response, result):
     ):
         return "missing_terminal"
     if result.get("error") or result.get("status") in ("failed", "cancelled"):
-        return "sse_business"
+        preview = response.extensions.get("gateway_preview")
+        return (
+            "upstream_business"
+            if preview is not None and preview.body_format == "json"
+            else "sse_business"
+        )
     return None
 
 

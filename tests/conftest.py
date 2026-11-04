@@ -73,3 +73,13 @@ def offline_price_catalogs(monkeypatch):
         return {}, []
 
     monkeypatch.setattr("app.pricing.catalogs", catalogs)
+
+
+@pytest.fixture(autouse=True)
+def legacy_adapter_defaults(monkeypatch):
+    # Existing protocol-conversion cases explicitly exercise the optional
+    # compatibility adapter. Native routing has its own end-to-end suite.
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "responses_passthrough", False)
+    monkeypatch.setattr(settings, "upstream_retry_base_delay_seconds", 0)

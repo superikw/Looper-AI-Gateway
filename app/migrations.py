@@ -150,6 +150,26 @@ async def initialize_database() -> None:
         usage_columns = await conn.run_sync(
             lambda c: {col["name"] for col in inspect(c).get_columns("usage_logs")}
         )
+        for field, definition in {
+            "retry_count": "INTEGER",
+            "is_final": "BOOLEAN NOT NULL DEFAULT 1",
+            "upstream_http_status": "INTEGER",
+            "failure_category": "VARCHAR(64)",
+            "elapsed_ms": "INTEGER",
+        }.items():
+            if field not in usage_columns:
+                await conn.execute(
+                    text(f"ALTER TABLE usage_logs ADD COLUMN {field} {definition}")
+                )
+        attempt_columns = await conn.run_sync(
+            lambda c: {
+                col["name"] for col in inspect(c).get_columns("upstream_attempts")
+            }
+        )
+        if "retry_count" not in attempt_columns:
+            await conn.execute(
+                text("ALTER TABLE upstream_attempts ADD COLUMN retry_count INTEGER")
+            )
         if "gateway_request_id" not in usage_columns:
             await conn.execute(
                 text("ALTER TABLE usage_logs ADD COLUMN gateway_request_id VARCHAR(64)")

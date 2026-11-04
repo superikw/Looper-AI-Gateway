@@ -193,7 +193,6 @@ async def pool_transport(monkeypatch):
             return httpx.Response(
                 outcome,
                 json={"error": {"message": f"HTTP {outcome}"}},
-                headers={"retry-after": "120"},
             )
         return httpx.Response(
             200,
@@ -270,9 +269,11 @@ async def test_rate_limited_account_fails_over_and_enters_cooldown(
     async with AsyncSessionLocal() as db:
         first = await db.get(UpstreamCredential, accounts[0])
         assert first.failure_count == 1
-        assert (first.cooldown_until - utcnow()).total_seconds() > 110
+        assert (first.cooldown_until - utcnow()).total_seconds() > 50
         assert (await db.get(ApiKey, key.id)).request_count == 1
-        assert (await db.scalar(select(UsageLog))).upstream_credential_id == accounts[1]
+        assert (
+            await db.scalar(select(UsageLog).where(UsageLog.is_final.is_(True)))
+        ).upstream_credential_id == accounts[1]
     assert (
         await client.post("/v1/chat/completions", headers=AUTH, json=BODY)
     ).status_code == 200
@@ -394,7 +395,9 @@ async def test_stream_failover_happens_before_output(
     )
     assert pool_transport["requests"] == ["account-0", "account-1"]
     async with AsyncSessionLocal() as db:
-        assert (await db.scalar(select(UsageLog))).upstream_credential_id == accounts[1]
+        assert (
+            await db.scalar(select(UsageLog).where(UsageLog.is_final.is_(True)))
+        ).upstream_credential_id == accounts[1]
         assert (await db.get(UpstreamCredential, accounts[1])).total_tokens == 6
 
 

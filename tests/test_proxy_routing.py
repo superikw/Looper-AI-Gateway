@@ -225,7 +225,6 @@ async def test_real_account_http_errors_still_cool_and_fail_over(
             return httpx.Response(
                 status,
                 json={"error": {"message": "account rejected"}},
-                headers={"retry-after": "120"},
             )
         return httpx.Response(200, json={"output": [], "output_text": "ok"})
 
