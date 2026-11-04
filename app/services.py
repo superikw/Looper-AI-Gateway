@@ -389,7 +389,11 @@ async def open_upstream(
                     and raw_body is None
                     and path in ("/v1/responses", "/v1/chat/completions")
                     and response.status_code == 200
-                    and "text/event-stream" in response.headers.get("content-type", "")
+                    and (
+                        not response.headers.get("content-type", "").strip()
+                        or "text/event-stream"
+                        in response.headers.get("content-type", "").lower()
+                    )
                 ):
                     preview = Preview(response)
                     response.extensions["gateway_preview"] = preview
@@ -530,10 +534,10 @@ async def iter_upstream_events(response: httpx.Response):
     try:
         preview = response.extensions.get("gateway_preview")
 
-        async def preview_lines():
+        async def preview_lines(chunks):
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             buffer = ""
-            async for chunk in preview.replay():
+            async for chunk in chunks:
                 buffer += decoder.decode(chunk)
                 while (match := re.search(r"\r\n|\r(?!$)|\n", buffer)) is not None:
                     yield buffer[: match.start()]
@@ -542,7 +546,33 @@ async def iter_upstream_events(response: httpx.Response):
             for line in buffer.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
                 yield line
 
-        source = preview_lines() if preview is not None else response.aiter_lines()
+        if preview is not None:
+            remaining = preview.replay().__aiter__()
+            prefix = []
+            # After a preview deadline, identify the body during normal stream
+            # consumption. This never re-enters the account retry loop.
+            while preview.body_format is None:
+                chunk = await anext(remaining, None)
+                if chunk is None:
+                    break
+                prefix.append(chunk)
+
+            async def replay():
+                for chunk in prefix:
+                    yield chunk
+                async for chunk in remaining:
+                    yield chunk
+
+            if preview.body_format == "json":
+                body = b"".join([chunk async for chunk in replay()])
+                yield {
+                    "type": "response.completed",
+                    "response": decode_upstream_body(response, body),
+                }
+                return
+            source = preview_lines(replay())
+        else:
+            source = response.aiter_lines()
         async for line in source:
             if not line:
                 event = decode_sse_data(lines)
@@ -589,10 +619,11 @@ def format_upstream_result(
 
 
 async def read_upstream_data(response: httpx.Response, path: str | None = None) -> dict:
+    preview = response.extensions.get("gateway_preview")
     if (
-        "text/event-stream" in response.headers.get("content-type", "")
-        and response.status_code < 400
-    ):
+        "text/event-stream" in response.headers.get("content-type", "").lower()
+        or (preview is not None and preview.body_format == "sse")
+    ) and response.status_code < 400:
         accumulator = ResponseAccumulator()
         async for event in iter_upstream_events(response):
             accumulator.add(event)
@@ -600,21 +631,31 @@ async def read_upstream_data(response: httpx.Response, path: str | None = None) 
                 break
         return accumulator.result()
     try:
-        await response.aread()
+        body = (
+            b"".join([chunk async for chunk in preview.replay()])
+            if preview is not None
+            else await response.aread()
+        )
     except httpx.RequestError as exc:
         raise network_error(exc) from None
+    return decode_upstream_body(response, body, path)
+
+
+def decode_upstream_body(
+    response: httpx.Response, body: bytes, path: str | None = None
+) -> dict:
     if response.status_code < 400:
-        raw_text = response.content.decode("utf-8", errors="replace")
+        raw_text = body.decode("utf-8", errors="replace")
         has_sse_data = raw_text.lstrip().startswith("data:") or "\ndata:" in raw_text
         if has_sse_data:
             return extract_sse_json(raw_text)
     try:
-        data = response.json(parse_constant=reject_constant)
+        data = json.loads(body, parse_constant=reject_constant)
     except ValueError:
         content_type = response.headers.get("content-type", "unknown")
         raise HTTPException(
             502,
-            f"upstream returned a non-JSON response (status={response.status_code}, content_type={content_type}, body_length={len(response.content)})",
+            f"upstream returned a non-JSON response (status={response.status_code}, content_type={content_type}, body_length={len(body)})",
         ) from None
     if not isinstance(data, dict):
         raise HTTPException(502, "upstream returned a non-object response")

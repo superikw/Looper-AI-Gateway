@@ -209,10 +209,13 @@ async def stream_to_upstream(
     response = await open_upstream(path, payload, db, api_key.upstream_credential_id)
     rid = request_id(response)
     cid = account_id_for_response(response)
-    content_type = response.headers.get("content-type", "")
+    content_type = response.headers.get("content-type", "").strip().lower()
+    preview = response.extensions.get("gateway_preview")
     try:
-        if response.status_code >= 400 or (
-            content_type and "text/event-stream" not in content_type
+        if (
+            response.status_code >= 400
+            or (content_type and "text/event-stream" not in content_type)
+            or (preview is not None and preview.body_format == "json")
         ):
             data = await read_upstream_data(response)
             code, result = format_upstream_result(
@@ -253,7 +256,6 @@ async def stream_to_upstream(
             events = json_events()
         else:
             events = iter_upstream_events(response)
-        preview = response.extensions.get("gateway_preview")
         defer_first = preview is not None and preview.boundary_reached
         first = None if defer_first else await anext(events, None)
         initial = ResponseAccumulator()

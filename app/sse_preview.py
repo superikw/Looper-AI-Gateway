@@ -38,6 +38,25 @@ class Preview:
         self.pending = None
         self.exhausted = False
         self.boundary_reached = False
+        self.body_format = (
+            "sse"
+            if "text/event-stream" in response.headers.get("content-type", "").lower()
+            else None
+        )
+        self._format_prefix = b""
+
+    def observe_format(self, chunk):
+        if self.body_format is not None:
+            return
+        prefix = (self._format_prefix + chunk).lstrip(b" \t\r\n")
+        # Only retain a possible split UTF-8 BOM, never an unbounded prefix.
+        if prefix and b"\xef\xbb\xbf".startswith(prefix):
+            self._format_prefix = prefix
+            return
+        prefix = prefix.removeprefix(b"\xef\xbb\xbf").lstrip(b" \t\r\n")
+        self._format_prefix = b""
+        if prefix:
+            self.body_format = "json" if prefix[:1] in (b"{", b"[") else "sse"
 
     async def _chunks(self, response):
         # Split available bytes without waiting to fill a chunk: lifecycle/text
@@ -66,6 +85,9 @@ class Preview:
                 break
             self.chunks.append(chunk)
             size += len(chunk)
+            self.observe_format(chunk)
+            if self.body_format == "json":
+                return None
             buffer += chunk
             while (match := _SEPARATOR.search(buffer)) is not None:
                 frame, buffer = buffer[: match.start()], buffer[match.end() :]
@@ -94,7 +116,9 @@ class Preview:
         return None
 
     async def replay(self):
+        self._format_prefix = b""
         for chunk in self.chunks:
+            self.observe_format(chunk)
             yield chunk
         self.chunks.clear()
         if self.pending is not None:
@@ -103,9 +127,11 @@ class Preview:
             if chunk is None:
                 self.exhausted = True
             else:
+                self.observe_format(chunk)
                 yield chunk
         if not self.exhausted:
             async for chunk in self.reader:
+                self.observe_format(chunk)
                 yield chunk
 
     async def close(self):

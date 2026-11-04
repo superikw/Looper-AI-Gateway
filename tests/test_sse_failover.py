@@ -112,6 +112,8 @@ async def pool(monkeypatch):
                 )
             )
         outcome = state["plans"].get(index, [life(), completed()])
+        if isinstance(outcome, httpx.Response):
+            return outcome
         if isinstance(outcome, Exception):
             raise outcome
         if isinstance(outcome, int):
@@ -125,7 +127,11 @@ async def pool(monkeypatch):
         return httpx.Response(
             200,
             headers={
-                "content-type": "text/event-stream",
+                **(
+                    {}
+                    if state.get("omit_content_type")
+                    else {"content-type": "text/event-stream"}
+                ),
                 "x-request-id": f"request-{index}",
             },
             stream=stream,
@@ -163,10 +169,12 @@ async def rows():
 @pytest.mark.parametrize("path", ["/v1/responses", "/v1/chat/completions"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("lifecycle", [False, True])
+@pytest.mark.parametrize("omit_content_type", [False, True])
 async def test_early_failure_switches_without_leaking_and_single_usage(
-    client, key, pool, path, stream, lifecycle
+    client, key, pool, path, stream, lifecycle, omit_content_type
 ):
     ids, state = pool
+    state["omit_content_type"] = omit_content_type
     state["plans"][0] = (
         [
             life("old-response"),
@@ -198,8 +206,12 @@ async def test_early_failure_switches_without_leaking_and_single_usage(
     assert active == 0 and all(s.closed for s in state["streams"])
 
 
-async def test_successful_buffer_preserves_events_once_in_order(client, key, pool):
+@pytest.mark.parametrize("omit_content_type", [False, True])
+async def test_successful_buffer_preserves_events_once_in_order(
+    client, key, pool, omit_content_type
+):
     _, state = pool
+    state["omit_content_type"] = omit_content_type
     source = [
         life(),
         event(
@@ -218,6 +230,85 @@ async def test_successful_buffer_preserves_events_once_in_order(client, key, poo
     ]
     assert received == source
     assert state["calls"] == [0]
+
+
+@pytest.mark.parametrize("path", ["/v1/responses", "/v1/chat/completions"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("content_type", [None, "application/json"])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_json_is_preserved_and_never_retried_as_sse(
+    client, key, pool, path, stream, content_type, failure
+):
+    _, state = pool
+    text = '普通 JSON\ndata: {"type":"response.failed"}\n\n'
+    body = failed()["response"] if failure else completed()["response"]
+    if not failure:
+        body["output_text"] = text
+    wire = (" \r\n" + json.dumps(body, ensure_ascii=False, indent=2)).encode()
+    source = Stream([wire[i : i + 1] for i in range(len(wire))])
+    upstream = httpx.Response(
+        200,
+        headers={"content-type": content_type} if content_type else {},
+        stream=source,
+    )
+    state["plans"][0] = upstream
+    response = await request(client, path, stream)
+    assert response.status_code == (502 if failure else 200), response.text
+    assert state["calls"] == [0]
+    assert (
+        OVERLOADED in response.text
+        if failure
+        else json.dumps(text, ensure_ascii=False)[1:-1] in response.text
+    )
+    attempts, logs, active = await rows()
+    assert len(attempts) == len(logs) == 1
+    assert active == 0 and source.closed
+    assert upstream.headers.get("content-type") == content_type
+
+
+@pytest.mark.parametrize("boundary", ["time", "bytes"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_headerless_json_after_preview_boundary_is_preserved(
+    client, key, pool, monkeypatch, boundary, stream
+):
+    _, state = pool
+    body = json.dumps(completed()["response"]).encode()
+    if boundary == "time":
+        monkeypatch.setattr(settings, "sse_preview_max_seconds", 0.005)
+        chunks = [0.03, body]
+    else:
+        monkeypatch.setattr(settings, "sse_preview_max_bytes", 1024)
+        chunks = [b" " * 1024, body]
+    source = Stream(chunks)
+    state["plans"][0] = httpx.Response(200, stream=source)
+    response = await request(client, stream=stream)
+    assert response.status_code == 200 and '"new-response"' in response.text
+    attempts, logs, active = await rows()
+    assert state["calls"] == [0] and len(attempts) == len(logs) == 1
+    assert logs[0].total_tokens == 6 and active == 0 and source.closed
+
+
+@pytest.mark.parametrize("body_format", ["json", "sse"])
+async def test_headerless_preview_replays_original_bytes(body_format):
+    from app.sse_preview import Preview
+
+    wire = (
+        (" \r\n" + json.dumps(completed()["response"], ensure_ascii=False)).encode()
+        if body_format == "json"
+        else ("data: " + json.dumps(life(), ensure_ascii=False) + "\n\n").encode()
+    )
+    source = Stream([wire[i : i + 1] for i in range(len(wire))])
+    response = httpx.Response(200, stream=source)
+    preview = Preview(response)
+    try:
+        assert await preview.scan(8, 65536, 1) is None
+        assert b"".join([chunk async for chunk in preview.replay()]) == wire
+        assert preview.body_format == body_format
+        assert "content-type" not in response.headers
+    finally:
+        await preview.close()
+        await response.aclose()
+    assert source.closed
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
@@ -284,10 +375,12 @@ async def test_failure_with_embedded_output_never_replays(client, key, pool):
 
 
 @pytest.mark.parametrize("boundary", ["events", "bytes", "time"])
+@pytest.mark.parametrize("omit_content_type", [False, True])
 async def test_after_preview_boundary_no_replay(
-    client, key, pool, monkeypatch, boundary
+    client, key, pool, monkeypatch, boundary, omit_content_type
 ):
     _, state = pool
+    state["omit_content_type"] = omit_content_type
     if boundary == "events":
         monkeypatch.setattr(settings, "sse_preview_max_events", 1)
         source = [life(), failed()]
